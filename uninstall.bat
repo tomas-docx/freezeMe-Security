@@ -11,5 +11,6 @@ if exist "%DIR%\freezeMe-Security.exe" (
 )
 schtasks /delete /tn freezeMe-Security /f >nul 2>&1
 rmdir /s /q "%DIR%" 2>nul
+del "%ProgramData%\Microsoft\Windows\Start Menu\Programs\freezeMe-Security Settings.lnk" 2>nul
 echo Removed
 pause

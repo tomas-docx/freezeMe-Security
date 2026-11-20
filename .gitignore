@@ -1,0 +1,5 @@
+*.exe
+*.pdb
+freeze.ini
+freeze.state
+logs/

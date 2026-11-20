@@ -1,23 +1,25 @@
 // freezeMe-Security - keyboard + mouse locker for Windows 10/11
 // (C) tomas-docx 2026
 //
-// Unlocks when you hold your combo (keys + mouse buttons together).
+// Unlocks when you press your combo (keys + mouse buttons, all within ComboWindowMs).
 // Build with build.bat. Has to stay C# 5 for the csc.exe that comes with Windows.
 //
 // Usage:
-//   freezeMe-Security.exe            normal, started by the scheduled task at sign-in
-//   freezeMe-Security.exe --enrol    set the combo (admin)
-//   freezeMe-Security.exe --test     freeze, unlock after TestSeconds
-//   freezeMe-Security.exe --stop     stop it (admin)
+//   freezeMe-Security.exe              normal, started by the scheduled task at sign-in
+//   freezeMe-Security.exe --settings   settings window (admin)
+//   freezeMe-Security.exe --enrol      set the unlock combo (admin)
+//   freezeMe-Security.exe --test       freeze, unlock after TestSeconds
+//   freezeMe-Security.exe --stop       stop it (admin)
 //
 // Sections (search "// 1." etc):
-//   1 Names  2 Native  3 Hooks  4 Config  5 State
-//   6 Program  7 Watchdog  8 LockerForm  9 EnrolForm
+//   1 Names  2 Native  3 Hooks  4 Config  5 State  6 Log  7 Program
+//   8 Watchdog  9 LockerForm  10 EnrolForm  11 SettingsForm
 //
 // Input ids: keys = virtual-key code (1-255), mouse = 1001 left, 1002 right,
 // 1003 middle, 1004 back, 1005 forward. In freeze.ini: K72,K91,M3 etc.
 //
 // OnButton/OnMotion run inside the hook, keep them fast (Windows drops slow hooks).
+// No disk or UI work in there, use BeginInvoke.
 
 using System;
 using System.Collections.Generic;
@@ -25,6 +27,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -34,6 +37,7 @@ namespace FreezeMeSecurity
     // 1. Names
     static class Names
     {
+        public const string App = "freezeMe-Security";
         public const string MainMutex = @"Local\freezeMe-Security.Main";
         public const string TestMutex = @"Local\freezeMe-Security.Test";
         public const string WatchdogMutex = @"Local\freezeMe-Security.Watchdog";
@@ -58,10 +62,8 @@ namespace FreezeMeSecurity
         public const int WM_RBUTTONUP = 0x0205;
         public const int WM_MBUTTONDOWN = 0x0207;
         public const int WM_MBUTTONUP = 0x0208;
-        public const int WM_MOUSEWHEEL = 0x020A;
         public const int WM_XBUTTONDOWN = 0x020B;
         public const int WM_XBUTTONUP = 0x020C;
-        public const int WM_MOUSEHWHEEL = 0x020E;
 
         public const int WM_WTSSESSION_CHANGE = 0x02B1;
         public const int WTS_SESSION_LOCK = 0x7;
@@ -139,6 +141,12 @@ namespace FreezeMeSecurity
         [DllImport("wtsapi32.dll")]
         public static extern bool WTSUnRegisterSessionNotification(IntPtr hWnd);
 
+        [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool WTSQuerySessionInformation(IntPtr hServer, int sessionId, int infoClass, out IntPtr buffer, out int bytes);
+
+        [DllImport("wtsapi32.dll")]
+        public static extern void WTSFreeMemory(IntPtr memory);
+
         // GetTickCount, same clock as GetLastInputInfo. Wraps, so keep the maths unchecked.
         public static uint Now()
         {
@@ -175,6 +183,33 @@ namespace FreezeMeSecurity
                 CloseDesktop(h);
             }
         }
+
+        // 1 = locked, 0 = unlocked, -1 = don't know. WTSSessionInfoEx, SessionFlags at offset 12.
+        public static int SessionLockState()
+        {
+            IntPtr buf;
+            int bytes;
+            try
+            {
+                if (!WTSQuerySessionInformation(IntPtr.Zero, -1, 25, out buf, out bytes)) return -1;
+            }
+            catch
+            {
+                return -1;
+            }
+            try
+            {
+                if (bytes < 16 || Marshal.ReadInt32(buf, 0) != 1) return -1;
+                int flags = Marshal.ReadInt32(buf, 12);
+                if (flags == 0) return 1;
+                if (flags == 1) return 0;
+                return -1;
+            }
+            finally
+            {
+                WTSFreeMemory(buf);
+            }
+        }
     }
 
     // 3. Hooks
@@ -182,7 +217,7 @@ namespace FreezeMeSecurity
     {
         // return true to swallow
         public static Func<int, bool, bool, bool, bool> OnButton;   // (id, down, up, injected)
-        public static Func<bool, bool> OnMotion;                     // (injected) for moves and scrolls
+        public static Func<bool, bool, bool> OnMotion;               // (isMove, injected) for moves and scrolls
         public static bool SwallowOnError;
         public static uint LastEventTick;
 
@@ -204,11 +239,6 @@ namespace FreezeMeSecurity
             msHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, msProc, mod, 0);
             LastEventTick = Native.Now();
             return kbHook != IntPtr.Zero && msHook != IntPtr.Zero;
-        }
-
-        public static bool Installed
-        {
-            get { return kbHook != IntPtr.Zero && msHook != IntPtr.Zero; }
         }
 
         public static void Uninstall()
@@ -268,7 +298,7 @@ namespace FreezeMeSecurity
                     }
                     bool swallow;
                     if (id != 0) swallow = OnButton != null && OnButton(id, down, !down, injected);
-                    else swallow = OnMotion != null && OnMotion(injected);
+                    else swallow = OnMotion != null && OnMotion(msg == Native.WM_MOUSEMOVE, injected);
                     if (swallow) return (IntPtr)1;
                 }
                 catch
@@ -283,19 +313,30 @@ namespace FreezeMeSecurity
     // 4. Config
     class Config
     {
-        public HashSet<int> Chord = new HashSet<int>();
-        public int IdleSeconds = 300;
-        public bool FreezeOnStart = true;
-        public bool FreezeOnUnlock = true;
-        public int StrikeLimit = 10;
+        public HashSet<int> Chord = new HashSet<int>();       // unlock combo
+        public HashSet<int> LockChord = new HashSet<int>();   // optional lock key, empty = off
+        public int ComboWindowMs = 1000;                       // all combo keys pressed within this
+        public int IdleSeconds = 300;                          // 0 = off
+        public int StrikeLimit = 10;                           // 0 = off
         public int StrikeWindowSeconds = 60;
+        public bool PhantomMouse = false;                      // cursor moves while frozen, clicks still blocked
+        public bool FreezeOnStart = true;
+        public int AfterWindowsUnlock = 1;                     // 0 leave as it was, 1 freeze, 2 unfreeze
         public int TestSeconds = 60;
+        public bool Debug = false;
 
         public static string Dir { get { return Path.GetDirectoryName(Application.ExecutablePath); } }
         public static string IniPath { get { return Path.Combine(Dir, "freeze.ini"); } }
         public static string StatePath { get { return Path.Combine(Dir, "freeze.state"); } }
+        public static string LogPath { get { return Path.Combine(Path.Combine(Dir, "logs"), "freeze-debug.log"); } }
 
         public bool IsValid { get { return HasKeyAndMouse(Chord); } }
+
+        public static DateTime Stamp()
+        {
+            try { return File.GetLastWriteTimeUtc(IniPath); }
+            catch { return DateTime.MinValue; }
+        }
 
         public static bool HasKeyAndMouse(IEnumerable<int> set)
         {
@@ -307,6 +348,19 @@ namespace FreezeMeSecurity
             return key && mouse;
         }
 
+        // a single key is only allowed if it's not one you'd type with
+        public static bool ValidLockKey(HashSet<int> set)
+        {
+            if (set.Count >= 2) return true;
+            if (set.Count != 1) return false;
+            foreach (int id in set)
+            {
+                if (id == 0x13 || id == 0x91 || id == 1004 || id == 1005) return true;   // Pause, Scroll Lock, side buttons
+                if (id >= 0x7C && id <= 0x87) return true;                                // F13-F24
+            }
+            return false;
+        }
+
         public static Config Load()
         {
             Config c = new Config();
@@ -314,6 +368,7 @@ namespace FreezeMeSecurity
             string[] lines;
             try { lines = File.ReadAllLines(IniPath); }
             catch { return c; }
+            bool sawAfterUnlock = false;
             foreach (string raw in lines)
             {
                 string line = raw.Trim();
@@ -325,15 +380,20 @@ namespace FreezeMeSecurity
                 switch (k)
                 {
                     case "chord": c.Chord = ParseChord(v); break;
+                    case "lockkey": c.LockChord = ParseChord(v); break;
+                    case "combowindowms": c.ComboWindowMs = ParseInt(v, c.ComboWindowMs, 200, 5000); break;
                     case "idleseconds":
                         c.IdleSeconds = ParseInt(v, c.IdleSeconds, 0, 86400);
                         if (c.IdleSeconds > 0 && c.IdleSeconds < 10) c.IdleSeconds = 10;
                         break;
-                    case "freezeonstart": c.FreezeOnStart = ParseBool(v, c.FreezeOnStart); break;
-                    case "freezeonunlock": c.FreezeOnUnlock = ParseBool(v, c.FreezeOnUnlock); break;
                     case "strikelimit": c.StrikeLimit = ParseInt(v, c.StrikeLimit, 0, 1000); break;
                     case "strikewindowseconds": c.StrikeWindowSeconds = ParseInt(v, c.StrikeWindowSeconds, 1, 3600); break;
+                    case "phantommouse": c.PhantomMouse = ParseBool(v, c.PhantomMouse); break;
+                    case "freezeonstart": c.FreezeOnStart = ParseBool(v, c.FreezeOnStart); break;
+                    case "afterwindowsunlock": c.AfterWindowsUnlock = ParseInt(v, c.AfterWindowsUnlock, 0, 2); sawAfterUnlock = true; break;
+                    case "freezeonunlock": if (!sawAfterUnlock) c.AfterWindowsUnlock = ParseBool(v, true) ? 1 : 0; break; // old name
                     case "testseconds": c.TestSeconds = ParseInt(v, c.TestSeconds, 5, 3600); break;
+                    case "debug": c.Debug = ParseBool(v, c.Debug); break;
                 }
             }
             return c;
@@ -341,23 +401,29 @@ namespace FreezeMeSecurity
 
         public string Save()
         {
-            List<string> parts = new List<string>();
-            foreach (int id in Sorted(Chord)) parts.Add(id >= 1000 ? "M" + (id - 1000) : "K" + id);
             string[] lines =
             {
-                "; freezeMe-Security settings. Change the combo with: freezeMe-Security.exe --enrol (admin)",
-                "Chord=" + string.Join(",", parts.ToArray()),
-                "; Seconds of no input before freezing (0 = off)",
+                "; freezeMe-Security settings. Easiest to change with: freezeMe-Security.exe --settings (admin)",
+                "Chord=" + Encode(Chord),
+                "; optional key combo that freezes straight away, blank = off",
+                "LockKey=" + Encode(LockChord),
+                "; all combo keys have to be pressed within this many ms",
+                "ComboWindowMs=" + ComboWindowMs,
+                "; seconds of no input before freezing (0 = off)",
                 "IdleSeconds=" + IdleSeconds,
-                "; Freeze as soon as you sign in (1 = yes, 0 = no)",
-                "FreezeOnStart=" + (FreezeOnStart ? 1 : 0),
-                "; Freeze again every time you unlock Windows (1 = yes, 0 = no)",
-                "FreezeOnUnlock=" + (FreezeOnUnlock ? 1 : 0),
-                "; Wrong presses within StrikeWindowSeconds that force a real Windows lock (0 = off)",
+                "; wrong presses within StrikeWindowSeconds that lock Windows (0 = off)",
                 "StrikeLimit=" + StrikeLimit,
                 "StrikeWindowSeconds=" + StrikeWindowSeconds,
-                "; How long --test mode stays frozen before unlocking itself",
-                "TestSeconds=" + TestSeconds
+                "; 1 = cursor still moves while frozen (clicks still blocked)",
+                "PhantomMouse=" + (PhantomMouse ? 1 : 0),
+                "; freeze as soon as you sign in",
+                "FreezeOnStart=" + (FreezeOnStart ? 1 : 0),
+                "; after you unlock Windows: 0 = leave as it was, 1 = freeze, 2 = unfreeze (password is enough)",
+                "AfterWindowsUnlock=" + AfterWindowsUnlock,
+                "; how long --test stays frozen",
+                "TestSeconds=" + TestSeconds,
+                "; 1 = write logs\\freeze-debug.log (logs keys pressed while frozen)",
+                "Debug=" + (Debug ? 1 : 0)
             };
             try
             {
@@ -368,6 +434,13 @@ namespace FreezeMeSecurity
             {
                 return ex.Message;
             }
+        }
+
+        static string Encode(IEnumerable<int> set)
+        {
+            List<string> parts = new List<string>();
+            foreach (int id in Sorted(set)) parts.Add(id >= 1000 ? "M" + (id - 1000) : "K" + id);
+            return string.Join(",", parts.ToArray());
         }
 
         static HashSet<int> ParseChord(string v)
@@ -413,6 +486,7 @@ namespace FreezeMeSecurity
         {
             List<string> names = new List<string>();
             foreach (int id in Sorted(set)) names.Add(Name(id));
+            if (names.Count == 0) return "(none)";
             return string.Join(" + ", names.ToArray());
         }
 
@@ -423,8 +497,8 @@ namespace FreezeMeSecurity
                 case 1001: return "Left click";
                 case 1002: return "Right click";
                 case 1003: return "Middle click";
-                case 1004: return "Mouse side button (back)";
-                case 1005: return "Mouse side button (forward)";
+                case 1004: return "Mouse back";
+                case 1005: return "Mouse forward";
                 case 0xA0: return "Left Shift";
                 case 0xA1: return "Right Shift";
                 case 0xA2: return "Left Ctrl";
@@ -437,6 +511,7 @@ namespace FreezeMeSecurity
                 case 0x91: return "Scroll Lock";
                 case 0x13: return "Pause";
                 case 0x2D: return "Insert";
+                case 0xDE: return "# (UK/IE)";
             }
             return ((Keys)id).ToString();
         }
@@ -470,7 +545,51 @@ namespace FreezeMeSecurity
         }
     }
 
-    // 6. Program
+    // 6. Log
+    // Only used when Debug=1. Add() just queues (safe in the hook), Flush() writes from the timer.
+    static class Log
+    {
+        public static bool Enabled;
+        static readonly Queue<string> queue = new Queue<string>();
+
+        public static void Add(string s)
+        {
+            if (!Enabled || queue.Count > 5000) return;
+            queue.Enqueue(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + s);
+        }
+
+        public static void Flush()
+        {
+            if (queue.Count == 0) return;
+            string text = string.Join(Environment.NewLine, queue.ToArray()) + Environment.NewLine;
+            queue.Clear();
+            Write(text);
+        }
+
+        public static void WriteNow(string s)
+        {
+            Write(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + s + Environment.NewLine);
+        }
+
+        static void Write(string text)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(Config.LogPath));
+                FileInfo fi = new FileInfo(Config.LogPath);
+                if (fi.Exists && fi.Length > 1024 * 1024)
+                {
+                    string old = Config.LogPath + ".old";
+                    if (File.Exists(old)) File.Delete(old);
+                    File.Move(Config.LogPath, old);
+                }
+                File.AppendAllText(Config.LogPath, text);
+            }
+            catch { }
+        }
+    }
+
+    // 7. Program
     static class Program
     {
         public static readonly int Pid = Process.GetCurrentProcess().Id;
@@ -497,9 +616,15 @@ namespace FreezeMeSecurity
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            if (mode == "--enrol" || mode == "--enroll")
+            if (mode == "--enrol" || mode == "--enroll" || mode == "--settings")
             {
-                Application.Run(new EnrolForm());
+                if (!IsAdmin())
+                {
+                    RelaunchElevated(mode);
+                    return 0;
+                }
+                if (mode == "--settings") Application.Run(new SettingsForm());
+                else Application.Run(new EnrolForm(EnrolMode.Unlock, true));
                 return 0;
             }
 
@@ -511,7 +636,7 @@ namespace FreezeMeSecurity
             if (!cfg.IsValid)
             {
                 // no combo, no freeze
-                if (test) MessageBox.Show("No unlock combo saved yet.\n\nRun freezeMe-Security.exe --enrol as administrator first.", "freezeMe-Security");
+                if (test) MessageBox.Show("No unlock combo saved yet.\n\nRun freezeMe-Security.exe --settings as administrator first.", Names.App);
                 return 1;
             }
 
@@ -545,9 +670,27 @@ namespace FreezeMeSecurity
             }
             catch (UnauthorizedAccessException)
             {
-                MessageBox.Show("Run this as administrator to stop it.", "freezeMe-Security");
+                MessageBox.Show("Run this as administrator to stop it.", Names.App);
                 return 5;
             }
+        }
+
+        public static bool IsAdmin()
+        {
+            try { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+            catch { return false; }
+        }
+
+        static void RelaunchElevated(string arguments)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath, arguments);
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";
+                Process.Start(psi);
+            }
+            catch { } // UAC cancelled
         }
 
         public static EventWaitHandle OpenOrCreateStop()
@@ -603,7 +746,7 @@ namespace FreezeMeSecurity
         }
     }
 
-    // 7. Watchdog
+    // 8. Watchdog
     // if main dies while frozen: lock windows and restart it
     static class Watchdog
     {
@@ -638,6 +781,7 @@ namespace FreezeMeSecurity
                     int deadPid;
                     bool wasFrozen;
                     if (!State.Read(out deadPid, out wasFrozen)) wasFrozen = true; // unknown, assume frozen
+                    if (Config.Load().Debug) Log.WriteNow("watchdog: main process died, frozen=" + wasFrozen);
                     if (wasFrozen) Native.LockWorkStation();
 
                     if (Native.Since(watchingSince) < 10000) quickDeaths++; else quickDeaths = 0;
@@ -682,21 +826,25 @@ namespace FreezeMeSecurity
         }
     }
 
-    // 8. LockerForm
+    // 9. LockerForm
     class LockerForm : Form
     {
-        readonly Config cfg;
+        Config cfg;
+        DateTime cfgStamp;
         readonly bool test;
         readonly bool startFrozen;
         readonly EventWaitHandle stop;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
 
         bool initDone, frozen, sessionLocked, tripArmed, pendingLock, watchdogSeen, closing;
-        uint frozenAt, unfrozenAt, lastLockCall, lastButtonEvent, activityFloor, lastWatchdogCheck;
+        bool desktopWasDefault = true;
+        uint frozenAt, unfrozenAt, activityFloor, lastLockCall;
+        uint lastWatchdogCheck, lastConfigCheck, lastPrune, lastFlush, lastSessionCheck;
+        int lockCalls;
 
-        readonly HashSet<int> held = new HashSet<int>();            // held right now (while frozen)
-        readonly HashSet<int> swallowedDowns = new HashSet<int>();  // downs we swallowed
-        readonly HashSet<int> swallowUps = new HashSet<int>();      // combo keys still down at unlock
+        readonly Dictionary<int, uint> held = new Dictionary<int, uint>();  // held now -> when it went down
+        readonly HashSet<int> swallowedDowns = new HashSet<int>();          // downs we swallowed
+        readonly HashSet<int> swallowUps = new HashSet<int>();              // combo keys still down at unlock
         readonly Queue<uint> strikes = new Queue<uint>();
 
         public LockerForm(Config cfg, bool test, bool startFrozen, EventWaitHandle stop)
@@ -705,13 +853,20 @@ namespace FreezeMeSecurity
             this.test = test;
             this.startFrozen = startFrozen;
             this.stop = stop;
+            cfgStamp = Config.Stamp();
+            Log.Enabled = cfg.Debug;
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.None;
             timer.Interval = 100;
             timer.Tick += OnTick;
-            activityFloor = Native.Now();
-            lastWatchdogCheck = Native.Now();
-            lastLockCall = unchecked(Native.Now() - 10000u);
+            uint now = Native.Now();
+            activityFloor = now;
+            lastWatchdogCheck = now;
+            lastConfigCheck = now;
+            lastPrune = now;
+            lastFlush = now;
+            lastSessionCheck = now;
+            lastLockCall = unchecked(now - 10000u);
         }
 
         // hidden, only here for session lock/unlock messages
@@ -728,11 +883,13 @@ namespace FreezeMeSecurity
             initDone = true;
 
             Native.WTSRegisterSessionNotification(Handle, 0);
+            sessionLocked = Native.SessionLockState() == 1 && !Native.InputDesktopIsDefault();
             Hooks.OnButton = OnButton;
             Hooks.OnMotion = OnMotion;
             Hooks.Install();
+            Log.Add("started" + (test ? " (test)" : ""));
 
-            if (startFrozen) Freeze();
+            if (startFrozen) Freeze("start");
             else if (!test) State.Write(false);
 
             if (!test) Program.SpawnDetached("--spawn-watchdog " + Program.Pid);
@@ -748,15 +905,35 @@ namespace FreezeMeSecurity
                 {
                     sessionLocked = true;
                     pendingLock = false;
+                    Log.Add("windows locked");
                 }
                 else if (code == Native.WTS_SESSION_UNLOCK)
                 {
-                    sessionLocked = false;
-                    activityFloor = Native.Now();
-                    if (frozen || (cfg.FreezeOnUnlock && !test)) Freeze();
+                    OnWindowsUnlocked("message");
                 }
             }
             base.WndProc(ref m);
+        }
+
+        void OnWindowsUnlocked(string how)
+        {
+            sessionLocked = false;
+            pendingLock = false;
+            activityFloor = Native.Now();
+            Log.Add("windows unlocked (" + how + ")");
+            if (test)
+            {
+                if (frozen) Freeze("after windows unlock");
+                return;
+            }
+            if (cfg.AfterWindowsUnlock == 2)
+            {
+                if (frozen) Unfreeze("windows password");
+            }
+            else if (cfg.AfterWindowsUnlock == 1 || frozen)
+            {
+                Freeze("after windows unlock");
+            }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -775,6 +952,8 @@ namespace FreezeMeSecurity
             Hooks.Uninstall();
             try { Native.WTSUnRegisterSessionNotification(Handle); } catch { }
             if (!test) State.Write(false);
+            Log.Add("exit");
+            Log.Flush();
             base.OnFormClosed(e);
         }
 
@@ -784,22 +963,46 @@ namespace FreezeMeSecurity
 
             if (stop != null && stop.WaitOne(0))
             {
+                Log.Add("stopped");
                 closing = true;
                 Close();
                 return;
+            }
+
+            uint now = Native.Now();
+            if (Native.Since(lastFlush) > 1000) { lastFlush = now; Log.Flush(); }
+            if (Native.Since(lastConfigCheck) > 2000) { lastConfigCheck = now; ReloadConfig(); }
+            if (Native.Since(lastPrune) > 5000) { lastPrune = now; PruneHeld(now); }
+
+            bool normalDesktop = Native.InputDesktopIsDefault();
+
+            // backup for a missed lock/unlock message
+            if (Native.Since(lastSessionCheck) > 1000)
+            {
+                lastSessionCheck = now;
+                int ls = Native.SessionLockState();
+                if (ls == 1 && !normalDesktop && !sessionLocked)
+                {
+                    sessionLocked = true;
+                    pendingLock = false;
+                    Log.Add("windows locked (polled)");
+                }
+                else if (ls == 0 && normalDesktop && sessionLocked)
+                {
+                    OnWindowsUnlocked("polled");
+                }
             }
 
             if (frozen)
             {
                 if (test && Native.Since(frozenAt) >= cfg.TestSeconds * 1000)
                 {
-                    Unfreeze();
+                    Unfreeze("test time up");
                     return;
                 }
 
                 if (!sessionLocked)
                 {
-                    bool normalDesktop = Native.InputDesktopIsDefault();
                     if (normalDesktop)
                     {
                         if (!tripArmed)
@@ -814,20 +1017,19 @@ namespace FreezeMeSecurity
                             if (gap > 1500)
                             {
                                 Hooks.Install();
-                                pendingLock = true;
+                                RequestLock("input got past the hook");
+                            }
+                            else if (pendingLock)
+                            {
+                                // came back from Ctrl+Alt+Del without locking (Cancel / Task Manager)
+                                if (!desktopWasDefault) CallLock("back from secure screen");
+                                else if (Native.Since(lastLockCall) > 3000 && lockCalls < 5) CallLock("retry");
                             }
                         }
                     }
-                    else if (tripArmed)
+                    else if (tripArmed && !pendingLock)
                     {
-                        // ctrl+alt+del screen while frozen
-                        pendingLock = true;
-                    }
-
-                    if (pendingLock && Native.Since(lastLockCall) > 500)
-                    {
-                        lastLockCall = Native.Now();
-                        Native.LockWorkStation();
+                        RequestLock("Ctrl+Alt+Del or secure screen");
                     }
                 }
             }
@@ -847,15 +1049,43 @@ namespace FreezeMeSecurity
                 if (cfg.IdleSeconds > 0 && !sessionLocked)
                 {
                     int idle = Math.Min(Native.Since(Native.LastInputTick()), Native.Since(activityFloor));
-                    if (idle >= cfg.IdleSeconds * 1000) Freeze();
+                    if (idle >= cfg.IdleSeconds * 1000) Freeze("idle");
                 }
             }
+
+            desktopWasDefault = normalDesktop;
 
             if (!test && Native.Since(lastWatchdogCheck) > 2000)
             {
                 lastWatchdogCheck = Native.Now();
                 CheckWatchdog();
             }
+        }
+
+        void ReloadConfig()
+        {
+            DateTime st = Config.Stamp();
+            if (st == cfgStamp) return;
+            cfgStamp = st;
+            Config n = Config.Load();
+            if (!n.IsValid) n.Chord = cfg.Chord; // never end up with no way to unlock
+            cfg = n;
+            Log.Enabled = cfg.Debug;
+            Log.Add("settings reloaded");
+        }
+
+        void PruneHeld(uint now)
+        {
+            List<int> old = null;
+            foreach (KeyValuePair<int, uint> kv in held)
+            {
+                if (unchecked((int)(now - kv.Value)) > 60000)
+                {
+                    if (old == null) old = new List<int>();
+                    old.Add(kv.Key);
+                }
+            }
+            if (old != null) foreach (int id in old) held.Remove(id);
         }
 
         void CheckWatchdog()
@@ -865,12 +1095,12 @@ namespace FreezeMeSecurity
                 watchdogSeen = true;
                 return;
             }
-            if (watchdogSeen && frozen) ForceWindowsLock(); // watchdog killed while frozen
+            if (watchdogSeen && frozen) RequestLock("watchdog killed");
             watchdogSeen = false;
             Program.SpawnDetached("--spawn-watchdog " + Program.Pid);
         }
 
-        void Freeze()
+        void Freeze(string reason)
         {
             frozen = true;
             frozenAt = Native.Now();
@@ -881,100 +1111,145 @@ namespace FreezeMeSecurity
             swallowUps.Clear();
             strikes.Clear();
             Hooks.SwallowOnError = true;
-            if (!test) State.Write(true);
+            Log.Add("FROZEN: " + reason);
+            if (!test) BeginInvoke(new Action(delegate { State.Write(true); }));
         }
 
-        void Unfreeze()
+        void Unfreeze(string reason)
         {
             frozen = false;
             pendingLock = false;
             Hooks.SwallowOnError = false;
             swallowUps.Clear();
-            swallowUps.UnionWith(held);
+            swallowUps.UnionWith(held.Keys);
             held.Clear();
             swallowedDowns.Clear();
             strikes.Clear();
             activityFloor = Native.Now();
             unfrozenAt = Native.Now();
-            if (!test) BeginInvoke(new Action(delegate { State.Write(false); })); // not inside the hook
+            Log.Add("UNFROZEN: " + reason);
+            if (!test) BeginInvoke(new Action(delegate { State.Write(false); }));
         }
 
-        void ForceWindowsLock()
+        void RequestLock(string reason)
         {
             if (sessionLocked) return;
             pendingLock = true;
+            lockCalls = 0;
+            CallLock(reason);
+        }
+
+        void CallLock(string reason)
+        {
             lastLockCall = Native.Now();
+            lockCalls++;
+            Log.Add("windows lock: " + reason);
             Native.LockWorkStation();
         }
 
-        void Strike(uint now)
+        void Strike(uint now, int id)
         {
             if (cfg.StrikeLimit <= 0) return;
             strikes.Enqueue(now);
             while (strikes.Count > 0 && unchecked((int)(now - strikes.Peek())) > cfg.StrikeWindowSeconds * 1000) strikes.Dequeue();
+            if (Log.Enabled) Log.Add("wrong press " + Config.Name(id) + " (" + strikes.Count + "/" + cfg.StrikeLimit + ")");
             if (strikes.Count >= cfg.StrikeLimit)
             {
                 strikes.Clear();
-                BeginInvoke(new Action(ForceWindowsLock));
+                BeginInvoke(new Action(delegate { RequestLock(cfg.StrikeLimit + " wrong presses"); }));
             }
+        }
+
+        // true if the keys pressed in the last ComboWindowMs are exactly this combo.
+        // older held keys are ignored, so a stuck or stray key times out on its own.
+        bool RecentMatches(HashSet<int> combo, uint now)
+        {
+            if (combo.Count == 0) return false;
+            int n = 0;
+            foreach (KeyValuePair<int, uint> kv in held)
+            {
+                if (unchecked((int)(now - kv.Value)) > cfg.ComboWindowMs) continue;
+                if (!combo.Contains(kv.Key)) return false;
+                n++;
+            }
+            return n == combo.Count;
         }
 
         // hook callback
         bool OnButton(int id, bool down, bool up, bool injected)
         {
+            if (sessionLocked) return false; // never touch the lock screen
+
+            uint now = Native.Now();
+
             if (!frozen)
             {
-                if (up && swallowUps.Remove(id)) return true;
-                if (down) swallowUps.Remove(id);
+                if (up)
+                {
+                    held.Remove(id);
+                    return swallowUps.Remove(id);
+                }
+                if (down)
+                {
+                    swallowUps.Remove(id);
+                    if (injected || held.ContainsKey(id)) return false;
+                    held[id] = now;
+                    if (RecentMatches(cfg.LockChord, now))
+                    {
+                        Freeze("lock key");
+                        swallowedDowns.Add(id); // eat this key's up too
+                        return true;
+                    }
+                }
                 return false;
             }
 
             if (injected) return true; // ignore SendInput etc
 
-            uint now = Native.Now();
-            if (unchecked((int)(now - lastButtonEvent)) > 10000) held.Clear(); // in case an up got lost
-            lastButtonEvent = now;
-
             if (down)
             {
-                bool repeat = held.Contains(id); // autorepeat
-                held.Add(id);
                 swallowedDowns.Add(id);
-                if (!repeat)
+                if (held.ContainsKey(id)) return true; // autorepeat
+                held[id] = now;
+                if (Log.Enabled) Log.Add("down " + Config.Name(id));
+                if (RecentMatches(cfg.Chord, now))
                 {
-                    if (held.SetEquals(cfg.Chord))
-                    {
-                        Unfreeze();
-                        return true;
-                    }
-                    if (!cfg.Chord.Contains(id)) Strike(now);
+                    Unfreeze("combo");
+                    return true;
                 }
+                if (!cfg.Chord.Contains(id)) Strike(now, id);
                 return true;
             }
 
             if (up)
             {
                 held.Remove(id);
-                if (swallowedDowns.Remove(id)) return true;
-                return false; // pressed before freeze, let it through
+                bool ours = swallowedDowns.Remove(id);
+                // letting go of a stray key can leave exactly the combo held
+                if (!cfg.Chord.Contains(id) && RecentMatches(cfg.Chord, now)) Unfreeze("combo");
+                return ours; // not ours = pressed before the freeze, let it through
             }
 
             return true;
         }
 
-        bool OnMotion(bool injected)
+        bool OnMotion(bool isMove, bool injected)
         {
-            return frozen;
+            if (sessionLocked || !frozen) return false;
+            if (isMove && cfg.PhantomMouse && !injected) return false; // phantom mouse: moves, does nothing
+            return true;
         }
     }
 
-    // 9. EnrolForm
+    // 10. EnrolForm
+    enum EnrolMode { Unlock, LockKey }
+
     class EnrolForm : Form
     {
-        const string Intro =
-            "Hold your combo (keys + mouse buttons) then let go.\n\n" +
-            "Esc to cancel.";
+        public HashSet<int> Result;
 
+        readonly EnrolMode mode;
+        readonly bool saveDirectly;
         readonly Label label = new Label();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly HashSet<int> current = new HashSet<int>();
@@ -984,9 +1259,21 @@ namespace FreezeMeSecurity
         uint lastInput, finishedAt;
         bool finished;
 
-        public EnrolForm()
+        string Intro
         {
-            Text = "freezeMe-Security - set your unlock combo";
+            get
+            {
+                if (mode == EnrolMode.Unlock)
+                    return "Press your UNLOCK combo (keys + at least one mouse button)\nwithin about a second, hold it, then let go.\n\nEsc to cancel.";
+                return "Press your LOCK key combo (e.g. Ctrl + #), then let go.\n\nEsc to cancel.";
+            }
+        }
+
+        public EnrolForm(EnrolMode mode, bool saveDirectly)
+        {
+            this.mode = mode;
+            this.saveDirectly = saveDirectly;
+            Text = Names.App + (mode == EnrolMode.Unlock ? " - unlock combo" : " - lock key");
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(720, 320);
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1011,7 +1298,7 @@ namespace FreezeMeSecurity
             base.OnShown(e);
             Hooks.SwallowOnError = false;
             Hooks.OnButton = OnButton;
-            Hooks.OnMotion = delegate(bool injected) { return false; };
+            Hooks.OnMotion = delegate(bool isMove, bool injected) { return false; };
             if (!Hooks.Install()) label.Text = "Couldn't hook the keyboard and mouse.\nRun this as administrator.";
             Activate();
             timer.Start();
@@ -1028,7 +1315,11 @@ namespace FreezeMeSecurity
         {
             if (finished)
             {
-                if (Native.Since(finishedAt) > 6000) Close();
+                if (Native.Since(finishedAt) > (saveDirectly ? 4000 : 1200))
+                {
+                    if (!saveDirectly) DialogResult = DialogResult.OK;
+                    Close();
+                }
                 return;
             }
             if (Native.Since(lastInput) > 120000) Close(); // 2 min timeout
@@ -1086,37 +1377,231 @@ namespace FreezeMeSecurity
 
         void Captured(HashSet<int> got)
         {
-            if (!Config.HasKeyAndMouse(got))
+            if (mode == EnrolMode.Unlock && !Config.HasKeyAndMouse(got))
             {
-                label.Text = "Got: " + Config.Describe(got) + "\n\nIt needs at least one KEYBOARD key AND one MOUSE button.\nTry again.";
+                label.Text = "Got: " + Config.Describe(got) + "\n\nNeeds at least one KEYBOARD key AND one MOUSE button.\nTry again.";
+                return;
+            }
+            if (mode == EnrolMode.LockKey && !Config.ValidLockKey(got))
+            {
+                label.Text = "Got: " + Config.Describe(got) + "\n\nUse 2+ keys (e.g. Ctrl + #). A single key only works for\nPause, Scroll Lock, F13-F24 or a mouse side button.\nTry again.";
                 return;
             }
             if (first == null)
             {
                 first = got;
-                label.Text = "Got: " + Config.Describe(got) + "\n\nNow do the same combo again to confirm.";
+                label.Text = "Got: " + Config.Describe(got) + "\n\nDo it again to confirm.";
                 return;
             }
             if (!first.SetEquals(got))
             {
                 first = null;
-                label.Text = "That didn't match the first one. Starting over.\n\n" + Intro;
+                label.Text = "Didn't match the first one. Start again.\n\n" + Intro;
                 return;
             }
 
-            Config cfg = Config.Load();
-            cfg.Chord = new HashSet<int>(first);
+            if (saveDirectly)
+            {
+                Config cfg = Config.Load();
+                if (mode == EnrolMode.Unlock) cfg.Chord = new HashSet<int>(first);
+                else cfg.LockChord = new HashSet<int>(first);
+                string err = cfg.Save();
+                if (err != null)
+                {
+                    first = null;
+                    label.Text = "Couldn't save: " + err + "\n\nRun this as administrator.";
+                    return;
+                }
+            }
+
+            Result = new HashSet<int>(first);
+            finished = true;
+            finishedAt = Native.Now();
+            label.Text = (saveDirectly ? "Saved: " : "Got it: ") + Config.Describe(first);
+        }
+    }
+
+    // 11. SettingsForm
+    class SettingsForm : Form
+    {
+        readonly Config cfg;
+        HashSet<int> chord;
+        HashSet<int> lockChord;
+
+        readonly Label chordLabel = new Label();
+        readonly Label lockLabel = new Label();
+        readonly NumericUpDown comboWindow = Num(200, 5000, 100);
+        readonly NumericUpDown idle = Num(0, 86400, 30);
+        readonly NumericUpDown strikeLimit = Num(0, 100, 1);
+        readonly NumericUpDown strikeWindow = Num(1, 3600, 10);
+        readonly NumericUpDown testSeconds = Num(5, 3600, 5);
+        readonly ComboBox afterUnlock = new ComboBox();
+        readonly CheckBox freezeOnStart = new CheckBox();
+        readonly CheckBox phantom = new CheckBox();
+        readonly CheckBox debug = new CheckBox();
+
+        public SettingsForm()
+        {
+            cfg = Config.Load();
+            chord = new HashSet<int>(cfg.Chord);
+            lockChord = new HashSet<int>(cfg.LockChord);
+
+            Text = Names.App + " settings";
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Font = new Font("Segoe UI", 10f);
+            Padding = new Padding(12);
+
+            afterUnlock.DropDownStyle = ComboBoxStyle.DropDownList;
+            afterUnlock.Width = 260;
+            afterUnlock.Items.Add("Leave it as it was");
+            afterUnlock.Items.Add("Freeze");
+            afterUnlock.Items.Add("Unfreeze (password is enough)");
+
+            freezeOnStart.Text = "Freeze when I sign in";
+            phantom.Text = "Phantom mouse (cursor moves while frozen, clicks do nothing)";
+            debug.Text = "Debug log (logs\\freeze-debug.log, includes keys pressed while frozen)";
+            foreach (CheckBox c in new CheckBox[] { freezeOnStart, phantom, debug }) c.AutoSize = true;
+            chordLabel.AutoSize = true;
+            lockLabel.AutoSize = true;
+
+            TableLayoutPanel t = new TableLayoutPanel();
+            t.ColumnCount = 2;
+            t.AutoSize = true;
+            t.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+
+            Row(t, "Unlock combo", Line(chordLabel, Btn("Change...", ChangeChord)));
+            Row(t, "Lock key", Line(lockLabel, Btn("Set...", SetLockKey), Btn("Clear", ClearLockKey)));
+            Row(t, "Combo window (ms)", comboWindow);
+            Row(t, "Lock after idle (seconds, 0 = off)", idle);
+            Row(t, "Wrong presses before Windows lock (0 = off)", strikeLimit);
+            Row(t, "...counted over (seconds)", strikeWindow);
+            Row(t, "After I unlock Windows", afterUnlock);
+            Row(t, "", freezeOnStart);
+            Row(t, "", phantom);
+            Row(t, "Test mode length (seconds)", testSeconds);
+            Row(t, "", debug);
+            Row(t, "", Line(Btn("Save", OnSave), Btn("Cancel", delegate { Close(); })));
+            Controls.Add(t);
+
+            comboWindow.Value = cfg.ComboWindowMs;
+            idle.Value = cfg.IdleSeconds;
+            strikeLimit.Value = Math.Min(cfg.StrikeLimit, 100);
+            strikeWindow.Value = cfg.StrikeWindowSeconds;
+            testSeconds.Value = cfg.TestSeconds;
+            afterUnlock.SelectedIndex = cfg.AfterWindowsUnlock;
+            freezeOnStart.Checked = cfg.FreezeOnStart;
+            phantom.Checked = cfg.PhantomMouse;
+            debug.Checked = cfg.Debug;
+            UpdateLabels();
+        }
+
+        static NumericUpDown Num(int min, int max, int step)
+        {
+            NumericUpDown n = new NumericUpDown();
+            n.Minimum = min;
+            n.Maximum = max;
+            n.Increment = step;
+            n.Width = 100;
+            return n;
+        }
+
+        static Button Btn(string text, EventHandler onClick)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.AutoSize = true;
+            b.Click += onClick;
+            return b;
+        }
+
+        static FlowLayoutPanel Line(params Control[] controls)
+        {
+            FlowLayoutPanel p = new FlowLayoutPanel();
+            p.AutoSize = true;
+            p.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            p.WrapContents = false;
+            p.Margin = new Padding(0);
+            foreach (Control c in controls)
+            {
+                c.Anchor = AnchorStyles.Left;
+                p.Controls.Add(c);
+            }
+            return p;
+        }
+
+        static void Row(TableLayoutPanel t, string text, Control c)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.Anchor = AnchorStyles.Left;
+            l.Margin = new Padding(3, 8, 12, 3);
+            t.Controls.Add(l);
+            c.Anchor = AnchorStyles.Left;
+            t.Controls.Add(c);
+        }
+
+        void UpdateLabels()
+        {
+            chordLabel.Text = Config.Describe(chord);
+            lockLabel.Text = lockChord.Count == 0 ? "(off)" : Config.Describe(lockChord);
+        }
+
+        void ChangeChord(object sender, EventArgs e)
+        {
+            using (EnrolForm f = new EnrolForm(EnrolMode.Unlock, false))
+            {
+                if (f.ShowDialog(this) == DialogResult.OK && f.Result != null) chord = f.Result;
+            }
+            UpdateLabels();
+        }
+
+        void SetLockKey(object sender, EventArgs e)
+        {
+            using (EnrolForm f = new EnrolForm(EnrolMode.LockKey, false))
+            {
+                if (f.ShowDialog(this) == DialogResult.OK && f.Result != null) lockChord = f.Result;
+            }
+            UpdateLabels();
+        }
+
+        void ClearLockKey(object sender, EventArgs e)
+        {
+            lockChord = new HashSet<int>();
+            UpdateLabels();
+        }
+
+        void OnSave(object sender, EventArgs e)
+        {
+            if (!Config.HasKeyAndMouse(chord))
+            {
+                MessageBox.Show(this, "Set an unlock combo first.", Names.App);
+                return;
+            }
+            cfg.Chord = chord;
+            cfg.LockChord = lockChord;
+            cfg.ComboWindowMs = (int)comboWindow.Value;
+            cfg.IdleSeconds = (int)idle.Value;
+            if (cfg.IdleSeconds > 0 && cfg.IdleSeconds < 10) cfg.IdleSeconds = 10;
+            cfg.StrikeLimit = (int)strikeLimit.Value;
+            cfg.StrikeWindowSeconds = (int)strikeWindow.Value;
+            cfg.TestSeconds = (int)testSeconds.Value;
+            cfg.AfterWindowsUnlock = afterUnlock.SelectedIndex < 0 ? 1 : afterUnlock.SelectedIndex;
+            cfg.FreezeOnStart = freezeOnStart.Checked;
+            cfg.PhantomMouse = phantom.Checked;
+            cfg.Debug = debug.Checked;
             string err = cfg.Save();
             if (err != null)
             {
-                first = null;
-                label.Text = "Couldn't save: " + err + "\n\nRun this as administrator.";
+                MessageBox.Show(this, "Couldn't save: " + err, Names.App);
                 return;
             }
-
-            finished = true;
-            finishedAt = Native.Now();
-            label.Text = "Saved. Your unlock combo:\n\n" + Config.Describe(first) + "\n\nThis window closes in a few seconds.";
+            Close();
         }
     }
 }

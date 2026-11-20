@@ -44,8 +44,11 @@ if (-not (Test-Path $ini) -or -not (Select-String -Path $ini -Pattern '^Chord=.+
     throw 'No combo saved, not installed.'
 }
 
-# admins + SYSTEM only
+# admins + SYSTEM only (combo file and debug logs)
 & icacls $ini /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' | Out-Null
+$logs = Join-Path $dir 'logs'
+New-Item -ItemType Directory -Force -Path $logs | Out-Null
+& icacls $logs /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' | Out-Null
 
 # run at sign-in as admin, no time limit
 $user      = "$env:USERDOMAIN\$env:USERNAME"
@@ -57,4 +60,13 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
 Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 
-Write-Host "Installed. Test with: `"$exe`" --test"
+# Start menu shortcut for the settings window
+$lnk = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) "$name Settings.lnk"
+$sh = New-Object -ComObject WScript.Shell
+$sc = $sh.CreateShortcut($lnk)
+$sc.TargetPath = $exe
+$sc.Arguments = '--settings'
+$sc.Save()
+
+Write-Host "Installed. Settings: Start menu > $name Settings"
+Write-Host "Test with: `"$exe`" --test"
