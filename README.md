@@ -38,6 +38,6 @@ Doesn't stop Win+L or Ctrl+Alt+Del (both just lock Windows) or the power button.
 
 Building it yourself: `build.bat` makes the exe (uses the csc.exe that comes with Windows), then compile `installer.iss` with Inno Setup 6 to get the setup in `dist\`. Pushing a `v*` tag makes GitHub Actions build both and attach them to a release with SHA256 hashes.
 
-Code is all in `freezeMe-Security.cs`, sections are numbered `// 1.` to `// 11.`. Has to stay C# 5 because the built-in csc.exe is old. When releasing, bump the version in both the .cs file and installer.iss. Don't commit `freeze.ini`, it has your combo. Plans are in `FUTURE.md`, changes in `CHANGELOG.md`.
+Code is all in `freezeMe-Security.cs`, sections are numbered `// 1.` to `// 11.`. Has to stay C# 5 because the built-in csc.exe is old. To release: Releases > Draft a new release > new tag like v1.2.2 > Publish. The build takes the version from the tag. Don't commit `freeze.ini`, it has your combo. Plans are in `FUTURE.md`, changes in `CHANGELOG.md`.
 
 (C) tomas-docx 2026. MIT licence, use it however you want but keep the copyright notice.
