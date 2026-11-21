@@ -14,6 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # tag v1.2.2 -> version 1.2.2 in the exe and the installer, no need to edit files
+      - name: Version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          (Get-Content freezeMe-Security.cs) -replace 'Version\("[0-9.]+"\)', "Version(""$v.0"")" | Set-Content freezeMe-Security.cs
+          "APP_VERSION=$v" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build exe
         shell: cmd
         run: build.bat nopause
@@ -22,7 +30,10 @@ jobs:
         run: choco install innosetup -y --no-progress
 
       - name: Build installer
-        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss'
+        run: |
+          $isccArgs = @()
+          if ($env:APP_VERSION) { $isccArgs += "/DAppVersion=$env:APP_VERSION" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @isccArgs installer.iss
 
       - name: Checksums
         run: |
