@@ -1,5 +1,7 @@
 # freezeMe-Security
 
+Download: grab freezeMe-Security-Setup.exe from the latest release (Releases on the right), run it, set your combo. The Code button is only needed if you want to build it yourself.
+
 Locks keyboard and mouse on Windows 10/11 until you press your combo (some keys + a mouse button, all within 1 second, e.g. Ctrl + Win + H + middle click). The screen stays as it is.
 
 It freezes when you sign in, after 5 min idle, after you unlock Windows, or when you press your lock key (optional, e.g. Ctrl + #). Plugging in another keyboard or mouse doesn't get around it, and software input (macros, remote tools) is ignored. Ctrl+Alt+Del can't be blocked by any program, so it locks Windows instead. Same if someone mashes keys (10 wrong presses in 60s by default) or kills the process.
