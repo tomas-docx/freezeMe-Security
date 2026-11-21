@@ -325,7 +325,11 @@ namespace FreezeMeSecurity
     // 4. Config
     class Config
     {
-        public HashSet<int> Chord = new HashSet<int>();       // unlock combo
+        public HashSet<int> Chord = new HashSet<int>();       // unlock combo (empty when stored as a hash)
+        public string ChordHash = "";                          // PBKDF2 of the combo, base64
+        public string ChordSalt = "";                          // base64
+        public int ChordCount = 0;                             // how many keys/buttons in the hashed combo
+        public const int HashIterations = 100000;
         public HashSet<int> LockChord = new HashSet<int>();   // optional lock key, empty = off
         public int ComboWindowMs = 1000;                       // all combo keys pressed within this
         public int IdleSeconds = 300;                          // 0 = off
@@ -343,7 +347,56 @@ namespace FreezeMeSecurity
         public static string StatePath { get { return Path.Combine(Dir, "freeze.state"); } }
         public static string LogPath { get { return Path.Combine(Path.Combine(Dir, "logs"), "freeze-debug.log"); } }
 
-        public bool IsValid { get { return HasKeyAndMouse(Chord); } }
+        public bool IsHashed { get { return ChordHash.Length > 0 && ChordSalt.Length > 0 && ChordCount >= 2; } }
+        public bool IsValid { get { return IsHashed || HasKeyAndMouse(Chord); } }
+
+        // store the combo either as-is or as a salted PBKDF2 hash
+        public void SetChord(HashSet<int> set, bool hash)
+        {
+            if (hash)
+            {
+                byte[] salt = new byte[16];
+                using (System.Security.Cryptography.RNGCryptoServiceProvider rng = new System.Security.Cryptography.RNGCryptoServiceProvider()) rng.GetBytes(salt);
+                ChordSalt = Convert.ToBase64String(salt);
+                ChordHash = HashOf(set, salt);
+                ChordCount = set.Count;
+                Chord = new HashSet<int>();
+            }
+            else
+            {
+                Chord = new HashSet<int>(set);
+                ChordHash = "";
+                ChordSalt = "";
+                ChordCount = 0;
+            }
+        }
+
+        // slow on purpose (~50ms), so never call this inside the hook
+        public bool CheckHashed(IEnumerable<int> set)
+        {
+            try
+            {
+                byte[] a = Convert.FromBase64String(HashOf(set, Convert.FromBase64String(ChordSalt)));
+                byte[] b = Convert.FromBase64String(ChordHash);
+                if (a.Length != b.Length) return false;
+                int diff = 0;
+                for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+                return diff == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static string HashOf(IEnumerable<int> set, byte[] salt)
+        {
+            List<string> parts = new List<string>();
+            foreach (int id in Sorted(set)) parts.Add(id.ToString());
+            byte[] pw = Encoding.UTF8.GetBytes(string.Join(",", parts.ToArray()));
+            using (System.Security.Cryptography.Rfc2898DeriveBytes k = new System.Security.Cryptography.Rfc2898DeriveBytes(pw, salt, HashIterations))
+                return Convert.ToBase64String(k.GetBytes(32));
+        }
 
         public static DateTime Stamp()
         {
@@ -393,6 +446,9 @@ namespace FreezeMeSecurity
                 switch (k)
                 {
                     case "chord": c.Chord = ParseChord(v); break;
+                    case "chordhash": c.ChordHash = v; break;
+                    case "chordsalt": c.ChordSalt = v; break;
+                    case "chordcount": c.ChordCount = ParseInt(v, 0, 0, 64); break;
                     case "lockkey": c.LockChord = ParseChord(v); break;
                     case "combowindowms": c.ComboWindowMs = ParseInt(v, c.ComboWindowMs, 200, 5000); break;
                     case "idleseconds":
@@ -417,7 +473,11 @@ namespace FreezeMeSecurity
             string[] lines =
             {
                 "; freezeMe-Security settings. Easiest to change from the Start menu: freezeMe-Security",
+                "; the combo is either in Chord, or stored as a hash in ChordHash/ChordSalt/ChordCount",
                 "Chord=" + Encode(Chord),
+                "ChordHash=" + ChordHash,
+                "ChordSalt=" + ChordSalt,
+                "ChordCount=" + ChordCount,
                 "; optional key combo that freezes straight away, blank = off",
                 "LockKey=" + Encode(LockChord),
                 "; all combo keys have to be pressed within this many ms",
@@ -431,7 +491,7 @@ namespace FreezeMeSecurity
                 "PhantomMouse=" + (PhantomMouse ? 1 : 0),
                 "; freeze as soon as you sign in",
                 "FreezeOnStart=" + (FreezeOnStart ? 1 : 0),
-                "; after you unlock Windows: 0 = leave as it was, 1 = freeze, 2 = unfreeze (password is enough)",
+                "; after you unlock Windows: 0 = leave as it was, 1 = freeze, 2 = unfreeze (NOT safe if someone knows your password)",
                 "AfterWindowsUnlock=" + AfterWindowsUnlock,
                 "; how long --test stays frozen",
                 "TestSeconds=" + TestSeconds,
@@ -1312,7 +1372,14 @@ namespace FreezeMeSecurity
             if (st == cfgStamp) return;
             cfgStamp = st;
             Config n = Config.Load();
-            if (!n.IsValid) n.Chord = cfg.Chord; // never end up with no way to unlock
+            if (!n.IsValid)
+            {
+                // never end up with no way to unlock
+                n.Chord = cfg.Chord;
+                n.ChordHash = cfg.ChordHash;
+                n.ChordSalt = cfg.ChordSalt;
+                n.ChordCount = cfg.ChordCount;
+            }
             cfg = n;
             Log.Enabled = cfg.Debug;
             Log.Add("settings reloaded");
@@ -1391,17 +1458,35 @@ namespace FreezeMeSecurity
             Native.LockWorkStation();
         }
 
+        // hashed combo: we can't tell which keys are in it, so every press counts and the
+        // limit is raised by the combo size (a correct unlock clears the count)
         void Strike(uint now, int id)
         {
             if (cfg.StrikeLimit <= 0) return;
+            int limit = cfg.IsHashed ? cfg.StrikeLimit + cfg.ChordCount : cfg.StrikeLimit;
             strikes.Enqueue(now);
             while (strikes.Count > 0 && unchecked((int)(now - strikes.Peek())) > cfg.StrikeWindowSeconds * 1000) strikes.Dequeue();
-            if (Log.Enabled) Log.Add("wrong press " + Config.Name(id) + " (" + strikes.Count + "/" + cfg.StrikeLimit + ")");
-            if (strikes.Count >= cfg.StrikeLimit)
+            if (Log.Enabled) Log.Add("wrong press " + (cfg.IsHashed ? "" : Config.Name(id) + " ") + "(" + strikes.Count + "/" + limit + ")");
+            if (strikes.Count >= limit)
             {
                 strikes.Clear();
                 BeginInvoke(new Action(delegate { RequestLock(cfg.StrikeLimit + " wrong presses"); }));
             }
+        }
+
+        // hashed combo: if the recent presses are the right size, check them on a background thread
+        void CheckHashedCombo(uint now)
+        {
+            List<int> recent = new List<int>();
+            foreach (KeyValuePair<int, uint> kv in held)
+                if (unchecked((int)(now - kv.Value)) <= cfg.ComboWindowMs) recent.Add(kv.Key);
+            if (recent.Count != cfg.ChordCount) return;
+            Config c = cfg;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                if (!c.CheckHashed(recent)) return;
+                try { BeginInvoke(new Action(delegate { if (frozen) Unfreeze("combo"); })); } catch { }
+            });
         }
 
         // true if the keys pressed in the last ComboWindowMs are exactly this combo.
@@ -1455,7 +1540,15 @@ namespace FreezeMeSecurity
                 swallowedDowns.Add(id);
                 if (held.ContainsKey(id)) return true; // autorepeat
                 held[id] = now;
-                if (Log.Enabled) Log.Add("down " + Config.Name(id));
+                if (cfg.IsHashed)
+                {
+                    if (Log.Enabled) Log.Add("press");
+                    Strike(now, id);
+                    CheckHashedCombo(now);
+                    return true;
+                }
+                // never write the combo's own keys to the log
+                if (Log.Enabled) Log.Add("down " + (cfg.Chord.Contains(id) ? "(combo key)" : Config.Name(id)));
                 if (RecentMatches(cfg.Chord, now))
                 {
                     Unfreeze("combo");
@@ -1470,7 +1563,8 @@ namespace FreezeMeSecurity
                 held.Remove(id);
                 bool ours = swallowedDowns.Remove(id);
                 // letting go of a stray key can leave exactly the combo held
-                if (!cfg.Chord.Contains(id) && RecentMatches(cfg.Chord, now)) Unfreeze("combo");
+                if (cfg.IsHashed) CheckHashedCombo(now);
+                else if (!cfg.Chord.Contains(id) && RecentMatches(cfg.Chord, now)) Unfreeze("combo");
                 return ours; // not ours = pressed before the freeze, let it through
             }
 
@@ -1647,7 +1741,7 @@ namespace FreezeMeSecurity
             if (saveDirectly)
             {
                 Config cfg = Config.Load();
-                if (mode == EnrolMode.Unlock) cfg.Chord = new HashSet<int>(first);
+                if (mode == EnrolMode.Unlock) cfg.SetChord(first, cfg.IsHashed);
                 else cfg.LockChord = new HashSet<int>(first);
                 string err = cfg.Save();
                 if (err != null)
@@ -1683,7 +1777,9 @@ namespace FreezeMeSecurity
         readonly CheckBox freezeOnStart = new CheckBox();
         readonly CheckBox phantom = new CheckBox();
         readonly CheckBox debug = new CheckBox();
+        readonly CheckBox hashCombo = new CheckBox();
         readonly Label status = new Label();
+        bool chordChanged;
 
         public SettingsForm()
         {
@@ -1705,12 +1801,13 @@ namespace FreezeMeSecurity
             afterUnlock.Width = 260;
             afterUnlock.Items.Add("Leave it as it was");
             afterUnlock.Items.Add("Freeze");
-            afterUnlock.Items.Add("Unfreeze (password is enough)");
+            afterUnlock.Items.Add("Unfreeze (NOT safe if someone knows your password)");
 
             freezeOnStart.Text = "Freeze when I sign in";
             phantom.Text = "Phantom mouse (cursor moves while frozen, clicks do nothing)";
+            hashCombo.Text = "Store the combo as a hash (can't be read back from freeze.ini)";
             debug.Text = "Debug log (logs\\freeze-debug.log, includes keys pressed while frozen)";
-            foreach (CheckBox c in new CheckBox[] { freezeOnStart, phantom, debug }) c.AutoSize = true;
+            foreach (CheckBox c in new CheckBox[] { freezeOnStart, phantom, debug, hashCombo }) c.AutoSize = true;
             chordLabel.AutoSize = true;
             lockLabel.AutoSize = true;
 
@@ -1724,6 +1821,7 @@ namespace FreezeMeSecurity
             Row(t, "Status", status);
             Row(t, "", Line(Btn("Install / update", OnInstall), Btn("Start now", OnStart), Btn("Test", OnTest), Btn("Uninstall", OnUninstall)));
             Row(t, "Unlock combo", Line(chordLabel, Btn("Change...", ChangeChord)));
+            Row(t, "", hashCombo);
             Row(t, "Lock key", Line(lockLabel, Btn("Set...", SetLockKey), Btn("Clear", ClearLockKey)));
             Row(t, "Combo window (ms)", comboWindow);
             Row(t, "Lock after idle (seconds, 0 = off)", idle);
@@ -1746,6 +1844,7 @@ namespace FreezeMeSecurity
             freezeOnStart.Checked = cfg.FreezeOnStart;
             phantom.Checked = cfg.PhantomMouse;
             debug.Checked = cfg.Debug;
+            hashCombo.Checked = cfg.IsHashed;
             UpdateLabels();
             UpdateStatus();
         }
@@ -1798,7 +1897,8 @@ namespace FreezeMeSecurity
 
         void UpdateLabels()
         {
-            chordLabel.Text = Config.Describe(chord);
+            if (!chordChanged && cfg.IsHashed) chordLabel.Text = "(hidden, stored as a hash)";
+            else chordLabel.Text = Config.Describe(chord);
             lockLabel.Text = lockChord.Count == 0 ? "(off)" : Config.Describe(lockChord);
         }
 
@@ -1806,7 +1906,11 @@ namespace FreezeMeSecurity
         {
             using (EnrolForm f = new EnrolForm(EnrolMode.Unlock, false))
             {
-                if (f.ShowDialog(this) == DialogResult.OK && f.Result != null) chord = f.Result;
+                if (f.ShowDialog(this) == DialogResult.OK && f.Result != null)
+                {
+                    chord = f.Result;
+                    chordChanged = true;
+                }
             }
             UpdateLabels();
         }
@@ -1826,6 +1930,12 @@ namespace FreezeMeSecurity
             UpdateLabels();
         }
 
+        string ComboText()
+        {
+            if (!chordChanged && cfg.IsHashed) return "your combo";
+            return Config.Describe(chord);
+        }
+
         void UpdateStatus()
         {
             bool installed = Setup.IsInstalled();
@@ -1836,12 +1946,31 @@ namespace FreezeMeSecurity
         // saves the form to freeze.ini. false if it didn't
         bool SaveSettings()
         {
-            if (!Config.HasKeyAndMouse(chord))
+            bool haveChord = chordChanged ? Config.HasKeyAndMouse(chord) : cfg.IsValid;
+            if (!haveChord)
             {
                 MessageBox.Show(this, "Set an unlock combo first.", Names.App);
                 return false;
             }
-            cfg.Chord = chord;
+            if (chordChanged)
+            {
+                cfg.SetChord(chord, hashCombo.Checked);
+            }
+            else if (hashCombo.Checked && !cfg.IsHashed)
+            {
+                cfg.SetChord(cfg.Chord, true);
+            }
+            else if (!hashCombo.Checked && cfg.IsHashed)
+            {
+                MessageBox.Show(this, "The hashed combo can't be turned back into plain text.\nPress Change... and enter it again to store it unhashed.", Names.App);
+                return false;
+            }
+            if (afterUnlock.SelectedIndex == 2 && cfg.AfterWindowsUnlock != 2)
+            {
+                string warn = "\"Unfreeze\" means anyone who knows your Windows password gets straight in after a lock.\n" +
+                              "If you're protecting against someone who's seen your password, keep it on Freeze.\n\nUse Unfreeze anyway?";
+                if (MessageBox.Show(this, warn, Names.App, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return false;
+            }
             cfg.LockChord = lockChord;
             cfg.ComboWindowMs = (int)comboWindow.Value;
             cfg.IdleSeconds = (int)idle.Value;
@@ -1887,7 +2016,7 @@ namespace FreezeMeSecurity
             }
             if (!SaveSettings()) return;
             string msg = freezeOnStart.Checked
-                ? "It will freeze straight away. Unlock with: " + Config.Describe(chord) + "\n\nStart now?"
+                ? "It will freeze straight away. Unlock with " + ComboText() + ".\n\nStart now?"
                 : "Start now?";
             if (MessageBox.Show(this, msg, Names.App, MessageBoxButtons.OKCancel) != DialogResult.OK) return;
             Setup.StartNow();
@@ -1903,7 +2032,7 @@ namespace FreezeMeSecurity
                 return;
             }
             if (!SaveSettings()) return;
-            string msg = "Freezes now and unlocks itself after " + testSeconds.Value + " seconds.\nUnlock early with: " + Config.Describe(chord) + "\n\nStart the test?";
+            string msg = "Freezes now and unlocks itself after " + testSeconds.Value + " seconds.\nUnlock early with " + ComboText() + ".\n\nStart the test?";
             if (MessageBox.Show(this, msg, Names.App, MessageBoxButtons.OKCancel) != DialogResult.OK) return;
             try { Process.Start(Config.InstalledExe, "--test"); }
             catch (Exception ex) { MessageBox.Show(this, "Couldn't start the test: " + ex.Message, Names.App); }

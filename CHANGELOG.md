@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0 - 21st of November 2026
+
+Added
+- Option to store the unlock combo as a salted hash (PBKDF2), so it can't be read out of freeze.ini.
+- Warning when picking "Unfreeze" after unlocking Windows, since that lets in anyone who knows your password.
+
+Fixed
+- The debug log no longer writes the combo's own keys. With a hashed combo it doesn't write key names at all.
+
 ## 1.2.1 - 21st of November 2026
 
 Fixed
