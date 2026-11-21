@@ -6,25 +6,17 @@ It freezes when you sign in, after 5 min idle, after you unlock Windows, or when
 
 Phantom mouse (optional): the cursor still moves while frozen but clicks and scrolling do nothing.
 
-Install:
+Install: download `freezeMe-Security-Setup-x.y.z.exe` from Releases and run it. It asks for your combo at the end. Uninstall from Apps & Features like anything else.
 
-1. run `build.bat`
-2. run `install.bat` as admin, enter your combo twice
-3. test it from an admin terminal, it unlocks itself after 60s:
+Or just the exe: double-click `freezeMe-Security.exe`, set your combo, press Install. The same window has Start now, Test and Uninstall.
 
-```
-"C:\Program Files\freezeMe-Security\freezeMe-Security.exe" --test
-```
+Settings: Start menu > freezeMe-Security (or double-click the exe). Changes apply within a couple of seconds. You can change the unlock combo, set or clear the lock key, the combo window, the idle time, the wrong-press limit and how long it's counted over, what happens after you unlock Windows (leave it, freeze, or unfreeze since the password is enough), phantom mouse, and a debug log.
 
-After that it starts every time you sign in. To start it now:
+Test mode: press Test in the settings window. It freezes and unlocks itself after 60s.
 
-```
-schtasks /run /tn freezeMe-Security
-```
+Silent install (for IT): `freezeMe-Security-Setup-x.y.z.exe /VERYSILENT`. Put a `freeze.ini` next to the setup exe to preset the combo and settings. Without one it installs but won't freeze until a combo is set.
 
-Settings: Start menu > freezeMe-Security Settings (or run the exe with `--settings`). Changes apply within a couple of seconds, no restart. You can change the unlock combo, set or clear the lock key, the combo window, the idle time, the wrong-press limit and how long it's counted over, what happens after you unlock Windows (stay frozen, freeze, or unfreeze since the password is enough), phantom mouse, and a debug log.
-
-It's all stored in `C:\Program Files\freezeMe-Security\freeze.ini` (admin only) if you'd rather edit it by hand:
+Settings file is `C:\Program Files\freezeMe-Security\freeze.ini` (admin only):
 
 ```
 Chord=K72,K91,K162,M3     K = virtual-key code, M1-M5 = left/right/middle/back/forward
@@ -40,12 +32,12 @@ TestSeconds=60
 Debug=0
 ```
 
-Other commands (admin): `--stop` stops it. `uninstall.bat` removes it.
-
-Forgot the combo? It doesn't run in Safe Mode. At the sign-in screen hold Shift and click Power > Restart, then Troubleshoot > Advanced options > Startup Settings > Restart, press 4. Sign in, delete `C:\Program Files\freezeMe-Security\freeze.ini`, restart normally and run `install.bat` again.
+Forgot the combo? It doesn't run in Safe Mode. At the sign-in screen hold Shift and click Power > Restart, then Troubleshoot > Advanced options > Startup Settings > Restart, press 4. Sign in, delete `C:\Program Files\freezeMe-Security\freeze.ini`, restart normally and run the setup again.
 
 Doesn't stop Win+L or Ctrl+Alt+Del (both just lock Windows) or the power button. Touchscreens/pens might get through. With phantom mouse on, hovering can still show tooltips and the like.
 
-Code is all in `freezeMe-Security.cs`, sections are numbered `// 1.` to `// 11.`. Edit, `build.bat`, `install.bat` again (keeps your settings), test with `--test`. Has to stay C# 5 because the csc.exe built into Windows is old. Don't commit `freeze.ini`, it has your combo. Plans are in `FUTURE.md`.
+Building it yourself: `build.bat` makes the exe (uses the csc.exe that comes with Windows), then compile `installer.iss` with Inno Setup 6 to get the setup in `dist\`. Pushing a `v*` tag makes GitHub Actions build both and attach them to a release with SHA256 hashes.
+
+Code is all in `freezeMe-Security.cs`, sections are numbered `// 1.` to `// 11.`. Has to stay C# 5 because the built-in csc.exe is old. When releasing, bump the version in both the .cs file and installer.iss. Don't commit `freeze.ini`, it has your combo. Plans are in `FUTURE.md`, changes in `CHANGELOG.md`.
 
 (C) tomas-docx 2026. MIT licence, use it however you want but keep the copyright notice.

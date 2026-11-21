@@ -14,3 +14,8 @@ Intruder log
 
 - Option to log the time, number of tries, which keys were pressed etc.
 - Option to take a silent photo or short video with the webcam (if there is one) when someone moves the mouse, presses keys or tries a wrong combo.
+
+Business / multi-user
+
+- Right now the sign-in task is made for whoever runs the setup. If a standard user installs it with an admin's password, it gets set up for the admin account instead. Needs a per-machine option that runs for every user who signs in.
+- Code signing once there's a company to sign under.

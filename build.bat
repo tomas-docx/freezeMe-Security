@@ -6,16 +6,16 @@ set "CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if not exist "%CSC%" set "CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
 if not exist "%CSC%" (
   echo csc.exe not found
-  pause
+  if /i not "%~1"=="nopause" pause
   exit /b 1
 )
 
-"%CSC%" /nologo /target:winexe /optimize+ /out:freezeMe-Security.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll freezeMe-Security.cs
+"%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /win32icon:app.ico /out:freezeMe-Security.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll freezeMe-Security.cs
 if errorlevel 1 (
   echo Build failed
-  pause
+  if /i not "%~1"=="nopause" pause
   exit /b 1
 )
 
 echo Done
-pause
+if /i not "%~1"=="nopause" pause

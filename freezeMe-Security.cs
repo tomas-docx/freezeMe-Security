@@ -5,11 +5,14 @@
 // Build with build.bat. Has to stay C# 5 for the csc.exe that comes with Windows.
 //
 // Usage:
-//   freezeMe-Security.exe              normal, started by the scheduled task at sign-in
-//   freezeMe-Security.exe --settings   settings window (admin)
+//   freezeMe-Security.exe              (double-click) settings window, install / start / test from there
+//   freezeMe-Security.exe --autostart  the locker, started by the scheduled task at sign-in
 //   freezeMe-Security.exe --enrol      set the unlock combo (admin)
 //   freezeMe-Security.exe --test       freeze, unlock after TestSeconds
 //   freezeMe-Security.exe --stop       stop it (admin)
+//   (internal: --setup [--silent], --remove-task, --watchdog, --start-frozen, --no-start-freeze)
+//
+// Settings and the installed exe always live in C:\Program Files\freezeMe-Security.
 //
 // Sections (search "// 1." etc):
 //   1 Names  2 Native  3 Hooks  4 Config  5 State  6 Log  7 Program
@@ -31,6 +34,14 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+
+[assembly: System.Reflection.AssemblyTitle("freezeMe-Security")]
+[assembly: System.Reflection.AssemblyDescription("Keyboard and mouse lock for Windows")]
+[assembly: System.Reflection.AssemblyCompany("tomas-docx")]
+[assembly: System.Reflection.AssemblyProduct("freezeMe-Security")]
+[assembly: System.Reflection.AssemblyCopyright("(C) tomas-docx 2026")]
+[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
 
 namespace FreezeMeSecurity
 {
@@ -184,7 +195,8 @@ namespace FreezeMeSecurity
             }
         }
 
-        // 1 = locked, 0 = unlocked, -1 = don't know. WTSSessionInfoEx, SessionFlags at offset 12.
+        // 1 = locked, 0 = unlocked, -1 = don't know. WTSINFOEXW: Level at 0, then the union
+        // starts at 8 (it has LARGE_INTEGERs so it's 8-aligned): SessionId 8, SessionState 12, SessionFlags 16.
         public static int SessionLockState()
         {
             IntPtr buf;
@@ -199,8 +211,8 @@ namespace FreezeMeSecurity
             }
             try
             {
-                if (bytes < 16 || Marshal.ReadInt32(buf, 0) != 1) return -1;
-                int flags = Marshal.ReadInt32(buf, 12);
+                if (bytes < 20 || Marshal.ReadInt32(buf, 0) != 1) return -1;
+                int flags = Marshal.ReadInt32(buf, 16);
                 if (flags == 0) return 1;
                 if (flags == 1) return 0;
                 return -1;
@@ -325,7 +337,8 @@ namespace FreezeMeSecurity
         public int TestSeconds = 60;
         public bool Debug = false;
 
-        public static string Dir { get { return Path.GetDirectoryName(Application.ExecutablePath); } }
+        public static string Dir { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Names.App); } }
+        public static string InstalledExe { get { return Path.Combine(Dir, Names.App + ".exe"); } }
         public static string IniPath { get { return Path.Combine(Dir, "freeze.ini"); } }
         public static string StatePath { get { return Path.Combine(Dir, "freeze.state"); } }
         public static string LogPath { get { return Path.Combine(Path.Combine(Dir, "logs"), "freeze-debug.log"); } }
@@ -403,7 +416,7 @@ namespace FreezeMeSecurity
         {
             string[] lines =
             {
-                "; freezeMe-Security settings. Easiest to change with: freezeMe-Security.exe --settings (admin)",
+                "; freezeMe-Security settings. Easiest to change from the Start menu: freezeMe-Security",
                 "Chord=" + Encode(Chord),
                 "; optional key combo that freezes straight away, blank = off",
                 "LockKey=" + Encode(LockChord),
@@ -427,6 +440,7 @@ namespace FreezeMeSecurity
             };
             try
             {
+                Directory.CreateDirectory(Dir);
                 File.WriteAllLines(IniPath, lines);
                 return null;
             }
@@ -616,6 +630,16 @@ namespace FreezeMeSecurity
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            if (mode == "--setup" || mode == "--remove-task")
+            {
+                if (!IsAdmin()) return 5;
+                if (mode == "--remove-task") return Setup.RemoveTask();
+                bool silent = args.Length > 1 && args[1].Trim().ToLowerInvariant() == "--silent";
+                return Setup.Run(silent);
+            }
+
+            if (mode == "") mode = "--settings"; // double-click opens the settings window
+
             if (mode == "--enrol" || mode == "--enroll" || mode == "--settings")
             {
                 if (!IsAdmin())
@@ -631,12 +655,18 @@ namespace FreezeMeSecurity
             // safe mode = way out if the combo is forgotten
             if (SystemInformation.BootMode != BootMode.Normal) return 0;
 
+            if (mode != "--autostart" && mode != "--test" && mode != "--start-frozen" && mode != "--no-start-freeze")
+            {
+                MessageBox.Show("Unknown option: " + args[0], Names.App);
+                return 2;
+            }
+
             bool test = mode == "--test";
             Config cfg = Config.Load();
             if (!cfg.IsValid)
             {
                 // no combo, no freeze
-                if (test) MessageBox.Show("No unlock combo saved yet.\n\nRun freezeMe-Security.exe --settings as administrator first.", Names.App);
+                if (test) MessageBox.Show("No unlock combo saved yet. Set one in the settings first.", Names.App);
                 return 1;
             }
 
@@ -650,10 +680,23 @@ namespace FreezeMeSecurity
                 EventWaitHandle stop = OpenOrCreateStop();
                 if (!test && stop != null) stop.Reset();
 
-                bool startFrozen = test || mode == "--start-frozen" || (cfg.FreezeOnStart && mode != "--no-start-freeze");
+                bool startFrozen = test || mode == "--start-frozen" || (cfg.FreezeOnStart && mode == "--autostart");
                 Application.Run(new LockerForm(cfg, test, startFrozen, stop));
             }
             return 0;
+        }
+
+        // stop a running copy and wait (up to 6s) for it and the watchdog to exit
+        public static void StopAndWait()
+        {
+            try { EventWaitHandle.OpenExisting(Names.StopEvent).Set(); }
+            catch { return; }
+            for (int i = 0; i < 30; i++)
+            {
+                if (!MutexExists(Names.MainMutex) && !MutexExists(Names.WatchdogMutex)) break;
+                Thread.Sleep(200);
+            }
+            Thread.Sleep(300);
         }
 
         static int Stop()
@@ -742,6 +785,193 @@ namespace FreezeMeSecurity
             catch
             {
                 return false;
+            }
+        }
+    }
+
+    // 7b. Setup (called by the installer)
+    static class Setup
+    {
+        static string ShortcutPath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Names.App + ".lnk"); } }
+
+        public static int Run(bool silent)
+        {
+            MigrateOldFreeze();
+            if (!silent && !Config.Load().IsValid) Application.Run(new EnrolForm(EnrolMode.Unlock, true));
+            SecureFiles();
+            try { File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Names.App + " Settings.lnk")); } catch { } // old name
+            CreateShortcut(ShortcutPath, Application.ExecutablePath, "--settings");
+            return RegisterTask();
+        }
+
+        public static bool IsInstalled()
+        {
+            return File.Exists(Config.InstalledExe) && Exec("schtasks.exe", "/query /tn \"" + Names.App + "\"") == 0;
+        }
+
+        public static bool IsRunning()
+        {
+            return Program.MutexExists(Names.MainMutex);
+        }
+
+        // copy this exe to Program Files (if it's not already running from there) and set it up.
+        // returns null if it worked, otherwise what went wrong
+        public static string Install()
+        {
+            Program.StopAndWait();
+            string src = Path.GetFullPath(Application.ExecutablePath);
+            string dst = Path.GetFullPath(Config.InstalledExe);
+            try
+            {
+                Directory.CreateDirectory(Config.Dir);
+                if (!string.Equals(src, dst, StringComparison.OrdinalIgnoreCase)) File.Copy(src, dst, true);
+            }
+            catch (Exception ex)
+            {
+                return "couldn't copy the exe: " + ex.Message;
+            }
+            int rc = Exec(dst, "--setup --silent");
+            if (rc != 0) return "creating the sign-in task failed (code " + rc + ")";
+            return null;
+        }
+
+        public static int StartNow()
+        {
+            return Exec("schtasks.exe", "/run /tn \"" + Names.App + "\"");
+        }
+
+        // returns true if this process should close (the uninstaller or the self-delete is taking over)
+        public static bool Uninstall()
+        {
+            string unins = Path.Combine(Config.Dir, "unins000.exe");
+            if (File.Exists(unins))
+            {
+                // installed with the setup exe: let its uninstaller do it
+                try { Process.Start(unins); return true; } catch { }
+            }
+            Program.StopAndWait();
+            RemoveTask();
+            try { File.Delete(ShortcutPath); } catch { }
+            try { File.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Names.App + " Settings.lnk")); } catch { }
+            string here = Path.GetFullPath(Application.ExecutablePath);
+            bool runningFromInstallDir = here.StartsWith(Path.GetFullPath(Config.Dir) + "\\", StringComparison.OrdinalIgnoreCase);
+            if (runningFromInstallDir)
+            {
+                // can't delete our own exe while it's running, so cmd does it a few seconds after we close
+                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c timeout /t 3 /nobreak >nul & rmdir /s /q \"" + Config.Dir + "\"");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                try { Process.Start(psi); } catch { }
+                return true;
+            }
+            try { Directory.Delete(Config.Dir, true); } catch { }
+            return false;
+        }
+
+        static void CreateShortcut(string lnkPath, string target, string arguments)
+        {
+            try
+            {
+                Type t = Type.GetTypeFromProgID("WScript.Shell");
+                object shell = Activator.CreateInstance(t);
+                object sc = t.InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnkPath });
+                Type st = sc.GetType();
+                st.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { target });
+                st.InvokeMember("Arguments", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { arguments });
+                st.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { target + ",0" });
+                st.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc, null);
+            }
+            catch { }
+        }
+
+        public static int RemoveTask()
+        {
+            return Exec("schtasks.exe", "/delete /tn \"" + Names.App + "\" /f");
+        }
+
+        // the task: at sign-in, as this user, highest privileges, no time limit, also on battery
+        static int RegisterTask()
+        {
+            string user = Environment.UserDomainName + "\\" + Environment.UserName;
+            string exe = Application.ExecutablePath;
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <RegistrationInfo><Author>tomas-docx</Author><Description>freezeMe-Security keyboard and mouse lock</Description></RegistrationInfo>\r\n" +
+                "  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + Esc(user) + "</UserId></LogonTrigger></Triggers>\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>" + Esc(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <AllowHardTerminate>true</AllowHardTerminate>\r\n" +
+                "    <StartWhenAvailable>false</StartWhenAvailable>\r\n" +
+                "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "    <Hidden>false</Hidden>\r\n" +
+                "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+                "    <Priority>4</Priority>\r\n" +
+                "    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>" + Esc(exe) + "</Command><Arguments>--autostart</Arguments></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+            string tmp = Path.Combine(Path.GetTempPath(), "freezeMe-Security-task.xml");
+            try
+            {
+                File.WriteAllText(tmp, xml, Encoding.Unicode);
+                return Exec("schtasks.exe", "/create /tn \"" + Names.App + "\" /xml \"" + tmp + "\" /f");
+            }
+            finally
+            {
+                try { File.Delete(tmp); } catch { }
+            }
+        }
+
+        // combo file and logs readable by admins + SYSTEM only
+        static void SecureFiles()
+        {
+            string logs = Path.GetDirectoryName(Config.LogPath);
+            try { Directory.CreateDirectory(logs); } catch { }
+            Exec("icacls.exe", "\"" + logs + "\" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F");
+            if (File.Exists(Config.IniPath))
+                Exec("icacls.exe", "\"" + Config.IniPath + "\" /inheritance:r /grant:r *S-1-5-32-544:F *S-1-5-18:F");
+        }
+
+        // old "Freeze" install from before the rename: stop it, keep its combo, remove it
+        static void MigrateOldFreeze()
+        {
+            string oldDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Freeze");
+            string oldExe = Path.Combine(oldDir, "Freeze.exe");
+            if (!File.Exists(oldExe)) return;
+            Exec(oldExe, "--stop");
+            Thread.Sleep(2000);
+            string oldIni = Path.Combine(oldDir, "freeze.ini");
+            try { if (File.Exists(oldIni) && !File.Exists(Config.IniPath)) File.Copy(oldIni, Config.IniPath); } catch { }
+            Exec("schtasks.exe", "/delete /tn Freeze /f");
+            try { Directory.Delete(oldDir, true); } catch { }
+        }
+
+        static string Esc(string s)
+        {
+            return System.Security.SecurityElement.Escape(s);
+        }
+
+        public static int Exec(string file, string arguments)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(file, arguments);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(30000)) return -1;
+                    return p.ExitCode;
+                }
+            }
+            catch
+            {
+                return -1;
             }
         }
     }
@@ -840,7 +1070,7 @@ namespace FreezeMeSecurity
         bool desktopWasDefault = true;
         uint frozenAt, unfrozenAt, activityFloor, lastLockCall;
         uint lastWatchdogCheck, lastConfigCheck, lastPrune, lastFlush, lastSessionCheck;
-        int lockCalls;
+        int lockCalls, lockedPolls, unlockedPolls;
 
         readonly Dictionary<int, uint> held = new Dictionary<int, uint>();  // held now -> when it went down
         readonly HashSet<int> swallowedDowns = new HashSet<int>();          // downs we swallowed
@@ -883,7 +1113,6 @@ namespace FreezeMeSecurity
             initDone = true;
 
             Native.WTSRegisterSessionNotification(Handle, 0);
-            sessionLocked = Native.SessionLockState() == 1 && !Native.InputDesktopIsDefault();
             Hooks.OnButton = OnButton;
             Hooks.OnMotion = OnMotion;
             Hooks.Install();
@@ -905,6 +1134,8 @@ namespace FreezeMeSecurity
                 {
                     sessionLocked = true;
                     pendingLock = false;
+                    lockedPolls = 0;
+                    unlockedPolls = 0;
                     Log.Add("windows locked");
                 }
                 else if (code == Native.WTS_SESSION_UNLOCK)
@@ -976,20 +1207,33 @@ namespace FreezeMeSecurity
 
             bool normalDesktop = Native.InputDesktopIsDefault();
 
-            // backup for a missed lock/unlock message
+            // backup for a missed lock/unlock message. needs 2 checks in a row either way,
+            // and never counts as locked while the normal desktop is showing.
             if (Native.Since(lastSessionCheck) > 1000)
             {
                 lastSessionCheck = now;
                 int ls = Native.SessionLockState();
-                if (ls == 1 && !normalDesktop && !sessionLocked)
+                if (!sessionLocked)
                 {
-                    sessionLocked = true;
-                    pendingLock = false;
-                    Log.Add("windows locked (polled)");
+                    unlockedPolls = 0;
+                    if (ls == 1 && !normalDesktop) lockedPolls++; else lockedPolls = 0;
+                    if (lockedPolls >= 2)
+                    {
+                        lockedPolls = 0;
+                        sessionLocked = true;
+                        pendingLock = false;
+                        Log.Add("windows locked (polled)");
+                    }
                 }
-                else if (ls == 0 && normalDesktop && sessionLocked)
+                else
                 {
-                    OnWindowsUnlocked("polled");
+                    lockedPolls = 0;
+                    if (normalDesktop && ls != 1) unlockedPolls++; else unlockedPolls = 0;
+                    if (unlockedPolls >= 2)
+                    {
+                        unlockedPolls = 0;
+                        OnWindowsUnlocked("polled");
+                    }
                 }
             }
 
@@ -1439,6 +1683,7 @@ namespace FreezeMeSecurity
         readonly CheckBox freezeOnStart = new CheckBox();
         readonly CheckBox phantom = new CheckBox();
         readonly CheckBox debug = new CheckBox();
+        readonly Label status = new Label();
 
         public SettingsForm()
         {
@@ -1474,6 +1719,10 @@ namespace FreezeMeSecurity
             t.AutoSize = true;
             t.AutoSizeMode = AutoSizeMode.GrowAndShrink;
 
+            status.AutoSize = true;
+            status.Font = new Font(Font, FontStyle.Bold);
+            Row(t, "Status", status);
+            Row(t, "", Line(Btn("Install / update", OnInstall), Btn("Start now", OnStart), Btn("Test", OnTest), Btn("Uninstall", OnUninstall)));
             Row(t, "Unlock combo", Line(chordLabel, Btn("Change...", ChangeChord)));
             Row(t, "Lock key", Line(lockLabel, Btn("Set...", SetLockKey), Btn("Clear", ClearLockKey)));
             Row(t, "Combo window (ms)", comboWindow);
@@ -1485,7 +1734,7 @@ namespace FreezeMeSecurity
             Row(t, "", phantom);
             Row(t, "Test mode length (seconds)", testSeconds);
             Row(t, "", debug);
-            Row(t, "", Line(Btn("Save", OnSave), Btn("Cancel", delegate { Close(); })));
+            Row(t, "", Line(Btn("Save", OnSave), Btn("Close", delegate { Close(); })));
             Controls.Add(t);
 
             comboWindow.Value = cfg.ComboWindowMs;
@@ -1498,6 +1747,7 @@ namespace FreezeMeSecurity
             phantom.Checked = cfg.PhantomMouse;
             debug.Checked = cfg.Debug;
             UpdateLabels();
+            UpdateStatus();
         }
 
         static NumericUpDown Num(int min, int max, int step)
@@ -1576,12 +1826,20 @@ namespace FreezeMeSecurity
             UpdateLabels();
         }
 
-        void OnSave(object sender, EventArgs e)
+        void UpdateStatus()
+        {
+            bool installed = Setup.IsInstalled();
+            bool running = Setup.IsRunning();
+            status.Text = (installed ? "Installed" : "Not installed") + ", " + (running ? "running" : "not running");
+        }
+
+        // saves the form to freeze.ini. false if it didn't
+        bool SaveSettings()
         {
             if (!Config.HasKeyAndMouse(chord))
             {
                 MessageBox.Show(this, "Set an unlock combo first.", Names.App);
-                return;
+                return false;
             }
             cfg.Chord = chord;
             cfg.LockChord = lockChord;
@@ -1599,9 +1857,69 @@ namespace FreezeMeSecurity
             if (err != null)
             {
                 MessageBox.Show(this, "Couldn't save: " + err, Names.App);
+                return false;
+            }
+            return true;
+        }
+
+        void OnSave(object sender, EventArgs e)
+        {
+            if (SaveSettings()) MessageBox.Show(this, "Saved.", Names.App);
+        }
+
+        void OnInstall(object sender, EventArgs e)
+        {
+            if (!SaveSettings()) return;
+            Cursor = Cursors.WaitCursor;
+            string err = Setup.Install();
+            Cursor = Cursors.Default;
+            UpdateStatus();
+            if (err != null) MessageBox.Show(this, "Install failed: " + err, Names.App);
+            else MessageBox.Show(this, "Installed. It starts every time you sign in.\n\nUse Test to try it, or Start now to run it without signing out.", Names.App);
+        }
+
+        void OnStart(object sender, EventArgs e)
+        {
+            if (!Setup.IsInstalled())
+            {
+                MessageBox.Show(this, "Install it first.", Names.App);
                 return;
             }
-            Close();
+            if (!SaveSettings()) return;
+            string msg = freezeOnStart.Checked
+                ? "It will freeze straight away. Unlock with: " + Config.Describe(chord) + "\n\nStart now?"
+                : "Start now?";
+            if (MessageBox.Show(this, msg, Names.App, MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+            Setup.StartNow();
+            Thread.Sleep(1500);
+            UpdateStatus();
+        }
+
+        void OnTest(object sender, EventArgs e)
+        {
+            if (!Setup.IsInstalled())
+            {
+                MessageBox.Show(this, "Install it first.", Names.App);
+                return;
+            }
+            if (!SaveSettings()) return;
+            string msg = "Freezes now and unlocks itself after " + testSeconds.Value + " seconds.\nUnlock early with: " + Config.Describe(chord) + "\n\nStart the test?";
+            if (MessageBox.Show(this, msg, Names.App, MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+            try { Process.Start(Config.InstalledExe, "--test"); }
+            catch (Exception ex) { MessageBox.Show(this, "Couldn't start the test: " + ex.Message, Names.App); }
+        }
+
+        void OnUninstall(object sender, EventArgs e)
+        {
+            if (MessageBox.Show(this, "Remove freezeMe-Security, its settings and its sign-in task?", Names.App, MessageBoxButtons.OKCancel) != DialogResult.OK) return;
+            bool closeNow = Setup.Uninstall();
+            if (closeNow)
+            {
+                Close();
+                return;
+            }
+            UpdateStatus();
+            MessageBox.Show(this, "Removed.", Names.App);
         }
     }
 }
