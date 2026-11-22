@@ -134,6 +134,18 @@ namespace FreezeMeSecurity
         [DllImport("user32.dll")]
         public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
+
+        public const int WM_POWERBROADCAST = 0x0218;
+        public const int PBT_APMRESUMESUSPEND = 0x0007;
+        public const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+
+        public static bool KeyDownNow(int vk)
+        {
+            return (GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool LockWorkStation();
 
@@ -231,25 +243,37 @@ namespace FreezeMeSecurity
         public static Func<int, bool, bool, bool, bool> OnButton;   // (id, down, up, injected)
         public static Func<bool, bool, bool> OnMotion;               // (isMove, injected) for moves and scrolls
         public static bool SwallowOnError;
-        public static uint LastEventTick;
+        public static uint LastEventTick;   // any hook event
+        public static uint LastKbTick;      // keyboard hook events
+        public static uint LastMsTick;      // mouse hook events
 
         static Native.HookProc kbProc;
         static Native.HookProc msProc;
         static IntPtr kbHook = IntPtr.Zero;
         static IntPtr msHook = IntPtr.Zero;
 
+        // windows can drop a low-level hook without telling us (slow callback, sleep/wake),
+        // so this gets called again regularly. new hooks go in before the old ones come out,
+        // so there's no gap where input gets through.
         public static bool Install()
         {
-            Uninstall();
             if (kbProc == null)
             {
                 kbProc = KbCallback;
                 msProc = MsCallback;
             }
             IntPtr mod = Native.GetModuleHandle(null);
-            kbHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, kbProc, mod, 0);
-            msHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, msProc, mod, 0);
-            LastEventTick = Native.Now();
+            IntPtr newKb = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, kbProc, mod, 0);
+            IntPtr newMs = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, msProc, mod, 0);
+            IntPtr oldKb = kbHook, oldMs = msHook;
+            if (newKb != IntPtr.Zero) kbHook = newKb;
+            if (newMs != IntPtr.Zero) msHook = newMs;
+            if (newKb != IntPtr.Zero && oldKb != IntPtr.Zero) Native.UnhookWindowsHookEx(oldKb);
+            if (newMs != IntPtr.Zero && oldMs != IntPtr.Zero) Native.UnhookWindowsHookEx(oldMs);
+            uint now = Native.Now();
+            LastEventTick = now;
+            LastKbTick = now;
+            LastMsTick = now;
             return kbHook != IntPtr.Zero && msHook != IntPtr.Zero;
         }
 
@@ -264,6 +288,7 @@ namespace FreezeMeSecurity
             if (nCode >= 0)
             {
                 LastEventTick = Native.Now();
+                LastKbTick = LastEventTick;
                 try
                 {
                     Native.KBDLLHOOKSTRUCT k = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
@@ -287,6 +312,7 @@ namespace FreezeMeSecurity
             if (nCode >= 0)
             {
                 LastEventTick = Native.Now();
+                LastMsTick = LastEventTick;
                 try
                 {
                     Native.MSLLHOOKSTRUCT m = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
@@ -594,10 +620,31 @@ namespace FreezeMeSecurity
     // 5. State
     static class State
     {
+        static readonly object gate = new object();
+        static bool latest;
+
         public static void Write(bool frozen)
         {
-            try { File.WriteAllText(Config.StatePath, Program.Pid + " " + (frozen ? "1" : "0")); }
-            catch { }
+            lock (gate)
+            {
+                try { File.WriteAllText(Config.StatePath, Program.Pid + " " + (frozen ? "1" : "0")); }
+                catch { }
+            }
+        }
+
+        // the locker's thread also runs the hooks, so disk writes go to a background thread.
+        // each write uses the newest value, so they can't land out of order.
+        public static void WriteInBackground(bool frozen)
+        {
+            lock (gate) latest = frozen;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                lock (gate)
+                {
+                    try { File.WriteAllText(Config.StatePath, Program.Pid + " " + (latest ? "1" : "0")); }
+                    catch { }
+                }
+            });
         }
 
         public static bool Read(out int pid, out bool frozen)
@@ -632,7 +679,16 @@ namespace FreezeMeSecurity
             queue.Enqueue(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + s);
         }
 
+        // the text is taken here, the disk write happens on a background thread
         public static void Flush()
+        {
+            if (queue.Count == 0) return;
+            string text = string.Join(Environment.NewLine, queue.ToArray()) + Environment.NewLine;
+            queue.Clear();
+            ThreadPool.QueueUserWorkItem(delegate { Write(text); });
+        }
+
+        public static void FlushNow()
         {
             if (queue.Count == 0) return;
             string text = string.Join(Environment.NewLine, queue.ToArray()) + Environment.NewLine;
@@ -645,8 +701,11 @@ namespace FreezeMeSecurity
             Write(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + s + Environment.NewLine);
         }
 
+        static readonly object writeGate = new object();
+
         static void Write(string text)
         {
+            lock (writeGate)
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Config.LogPath));
@@ -1129,6 +1188,8 @@ namespace FreezeMeSecurity
         bool initDone, frozen, sessionLocked, tripArmed, pendingLock, watchdogSeen, closing;
         bool desktopWasDefault = true;
         uint frozenAt, unfrozenAt, activityFloor, lastLockCall;
+        uint lastTick, lastRehook, lastDeviceCheck;
+        readonly HashSet<int> asyncBaseline = new HashSet<int>(); // keys already down when we froze
         uint lastWatchdogCheck, lastConfigCheck, lastPrune, lastFlush, lastSessionCheck;
         int lockCalls, lockedPolls, unlockedPolls;
 
@@ -1179,14 +1240,19 @@ namespace FreezeMeSecurity
             Log.Add("started" + (test ? " (test)" : ""));
 
             if (startFrozen) Freeze("start");
-            else if (!test) State.Write(false);
+            else if (!test) State.WriteInBackground(false);
 
-            if (!test) Program.SpawnDetached("--spawn-watchdog " + Program.Pid);
+            if (!test) ThreadPool.QueueUserWorkItem(delegate { Program.SpawnDetached("--spawn-watchdog " + Program.Pid); });
             timer.Start();
         }
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == Native.WM_POWERBROADCAST)
+            {
+                int ev = m.WParam.ToInt32();
+                if (ev == Native.PBT_APMRESUMESUSPEND || ev == Native.PBT_APMRESUMEAUTOMATIC) Rehook("resume from sleep");
+            }
             if (m.Msg == Native.WM_WTSSESSION_CHANGE)
             {
                 int code = m.WParam.ToInt32();
@@ -1208,6 +1274,7 @@ namespace FreezeMeSecurity
 
         void OnWindowsUnlocked(string how)
         {
+            Rehook("windows unlocked");
             sessionLocked = false;
             pendingLock = false;
             activityFloor = Native.Now();
@@ -1244,7 +1311,7 @@ namespace FreezeMeSecurity
             try { Native.WTSUnRegisterSessionNotification(Handle); } catch { }
             if (!test) State.Write(false);
             Log.Add("exit");
-            Log.Flush();
+            Log.FlushNow();
             base.OnFormClosed(e);
         }
 
@@ -1261,6 +1328,11 @@ namespace FreezeMeSecurity
             }
 
             uint now = Native.Now();
+
+            // the timer doesn't run during sleep, so a big gap means we just woke up
+            if (lastTick != 0 && unchecked((int)(now - lastTick)) > 5000) Rehook("timer gap (sleep/wake)");
+            lastTick = now;
+
             if (Native.Since(lastFlush) > 1000) { lastFlush = now; Log.Flush(); }
             if (Native.Since(lastConfigCheck) > 2000) { lastConfigCheck = now; ReloadConfig(); }
             if (Native.Since(lastPrune) > 5000) { lastPrune = now; PruneHeld(now); }
@@ -1318,16 +1390,21 @@ namespace FreezeMeSecurity
                         {
                             // input got past the hooks (windows can drop them), rehook + lock
                             int gap = unchecked((int)(Native.LastInputTick() - Hooks.LastEventTick));
-                            if (gap > 1500)
+                            string lost = gap > 1500 ? "input got past the hooks" : DeviceLeak(now);
+                            if (lost != null && !pendingLock)
                             {
-                                Hooks.Install();
-                                RequestLock("input got past the hook");
+                                Rehook(lost);
+                                RequestLock(lost);
                             }
-                            else if (pendingLock)
+                            else
                             {
-                                // came back from Ctrl+Alt+Del without locking (Cancel / Task Manager)
-                                if (!desktopWasDefault) CallLock("back from secure screen");
-                                else if (Native.Since(lastLockCall) > 3000 && lockCalls < 5) CallLock("retry");
+                                if (Native.Since(lastRehook) > 20000) Rehook(null); // routine refresh while frozen
+                                if (pendingLock)
+                                {
+                                    // came back from Ctrl+Alt+Del without locking (Cancel / Task Manager)
+                                    if (!desktopWasDefault) CallLock("back from secure screen");
+                                    else if (Native.Since(lastLockCall) > 3000 && lockCalls < 5) CallLock("retry");
+                                }
                             }
                         }
                     }
@@ -1350,6 +1427,8 @@ namespace FreezeMeSecurity
                     return;
                 }
 
+                if (!sessionLocked && Native.Since(lastRehook) > 60000) Rehook(null); // keeps the lock key working
+
                 if (cfg.IdleSeconds > 0 && !sessionLocked)
                 {
                     int idle = Math.Min(Native.Since(Native.LastInputTick()), Native.Since(activityFloor));
@@ -1364,6 +1443,58 @@ namespace FreezeMeSecurity
                 lastWatchdogCheck = Native.Now();
                 CheckWatchdog();
             }
+        }
+
+        void Rehook(string why)
+        {
+            Hooks.Install();
+            lastRehook = Native.Now();
+            if (why != null) Log.Add("rehooked: " + why);
+        }
+
+        // catches one hook dying while the other keeps going (e.g. keyboard dead, mouse still
+        // moving, so the shared "last event" time stays fresh): a key or button is physically down,
+        // we never saw it go down, and that device's hook has been quiet. returns why, or null.
+        string DeviceLeak(uint now)
+        {
+            if (Native.Since(lastDeviceCheck) < 250) return null;
+            lastDeviceCheck = now;
+            bool kbQuiet = Native.Since(Hooks.LastKbTick) > 1500;
+            bool msQuiet = Native.Since(Hooks.LastMsTick) > 1500;
+            List<int> released = null;
+            foreach (int vk in asyncBaseline)
+            {
+                if (!Native.KeyDownNow(vk))
+                {
+                    if (released == null) released = new List<int>();
+                    released.Add(vk);
+                }
+            }
+            if (released != null) foreach (int vk in released) asyncBaseline.Remove(vk);
+            if (!kbQuiet && !msQuiet) return null;
+
+            bool anyMouseHeld = false;
+            foreach (int id in held.Keys) if (id >= 1000) { anyMouseHeld = true; break; }
+
+            for (int vk = 1; vk < 255; vk++)
+            {
+                if (asyncBaseline.Contains(vk) || !Native.KeyDownNow(vk)) continue;
+                bool isMouse = vk == 1 || vk == 2 || vk == 4 || vk == 5 || vk == 6;
+                if (isMouse)
+                {
+                    if (msQuiet && !anyMouseHeld) return "mouse hook lost";
+                }
+                else
+                {
+                    if (!kbQuiet || held.ContainsKey(vk)) continue;
+                    // windows also reports the generic Shift/Ctrl/Alt codes; we only track left/right ones
+                    if (vk == 0x10 && (held.ContainsKey(0xA0) || held.ContainsKey(0xA1))) continue;
+                    if (vk == 0x11 && (held.ContainsKey(0xA2) || held.ContainsKey(0xA3))) continue;
+                    if (vk == 0x12 && (held.ContainsKey(0xA4) || held.ContainsKey(0xA5))) continue;
+                    return "keyboard hook lost";
+                }
+            }
+            return null;
         }
 
         void ReloadConfig()
@@ -1408,11 +1539,13 @@ namespace FreezeMeSecurity
             }
             if (watchdogSeen && frozen) RequestLock("watchdog killed");
             watchdogSeen = false;
-            Program.SpawnDetached("--spawn-watchdog " + Program.Pid);
+            ThreadPool.QueueUserWorkItem(delegate { Program.SpawnDetached("--spawn-watchdog " + Program.Pid); });
         }
 
         void Freeze(string reason)
         {
+            asyncBaseline.Clear();
+            for (int vk = 1; vk < 255; vk++) if (Native.KeyDownNow(vk)) asyncBaseline.Add(vk);
             frozen = true;
             frozenAt = Native.Now();
             tripArmed = false;
@@ -1423,7 +1556,7 @@ namespace FreezeMeSecurity
             strikes.Clear();
             Hooks.SwallowOnError = true;
             Log.Add("FROZEN: " + reason);
-            if (!test) BeginInvoke(new Action(delegate { State.Write(true); }));
+            if (!test) State.WriteInBackground(true);
         }
 
         void Unfreeze(string reason)
@@ -1439,7 +1572,7 @@ namespace FreezeMeSecurity
             activityFloor = Native.Now();
             unfrozenAt = Native.Now();
             Log.Add("UNFROZEN: " + reason);
-            if (!test) BeginInvoke(new Action(delegate { State.Write(false); }));
+            if (!test) State.WriteInBackground(false);
         }
 
         void RequestLock(string reason)

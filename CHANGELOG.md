@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.2 - 21st of November 2026
+
+Fixed
+- Freezing could get stuck (combo not working) after locking. The keyboard/mouse hooks share a thread with other work, and slow work on that thread (writing files, starting the watchdog) could make Windows drop a hook. That work now runs on a background thread so the hooks always answer quickly.
+
+## 1.3.1 - 21st of November 2026
+
+Fixed
+- After sleep or Win+L the combo could stop working no matter how many times you tried. Windows can quietly drop the keyboard or mouse hook, and the check for that missed it when the other one was still working (e.g. keyboard hook gone but the mouse still moving). It now checks each one separately.
+- Hooks are now reinstalled after waking from sleep, after unlocking Windows, and every so often in the background, with the new ones going in before the old ones come out so nothing slips through.
+
 ## 1.3.0 - 21st of November 2026
 
 Added
